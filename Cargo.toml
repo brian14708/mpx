@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/mpx-core", "crates/mpx-protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+futures-util = { version = "0.3", default-features = false }
+http = "1"
+mpx-protocol = { path = "crates/mpx-protocol" }
+percent-encoding = "2"
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+tokio = "1"
+uuid = "1"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "deny"
+explicit_outlives_requirements = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+unreachable_pub = "deny"
+unsafe_code = "deny"
+unused_extern_crates = "deny"
+unused_must_use = "deny"
+unused_qualifications = "deny"
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+redundant_pub_crate = "allow"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "deny"
