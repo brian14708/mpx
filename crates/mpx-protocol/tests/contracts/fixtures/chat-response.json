@@ -1,0 +1,16 @@
+{
+  "id": "chat_1",
+  "object": "chat.completion",
+  "created": 73,
+  "model": "m",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "Hi 🦉\nWelcome."},
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {"prompt_tokens": 11, "completion_tokens": 3},
+  "vendor_extension": {"limits": [0, -1, 7], "enabled": false}
+}

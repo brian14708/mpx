@@ -1,0 +1,7 @@
+data: {"id":"chat_1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi "}}]}
+
+data: {"id":"chat_1","model":"m","choices":[{"index":0,"delta":{"content":"🦉"}}]}
+
+data: {"id":"chat_1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}
+
+data: [DONE]

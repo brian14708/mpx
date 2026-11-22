@@ -1,0 +1,35 @@
+{
+  "id": "r",
+  "model": "m",
+  "content": [
+    {"type": "text", "text": "Look up Zürich 🦉\n"},
+    {
+      "type": "reasoning",
+      "text": "I need the exact spelling.",
+      "summary": ["Resolve the city name", "Look up the current weather"],
+      "seal": {"protocol": "generate_content", "value": "opaque-seal"},
+      "redacted": false,
+      "extra": {"protocol": "generate_content", "fields": {"trace": [null, {"visible": false}]}}
+    },
+    {"type": "reasoning", "text": "", "summary": [], "redacted": true},
+    {"type": "tool_call", "id": "call_1", "name": "lookup", "arguments": "{\"city\": \"Zürich\"}"},
+    {"type": "tool_call", "id": "call_2", "name": "lookup", "arguments": "{\"city\":"},
+    {"type": "native", "protocol": "generate_content", "json": {"vendor": ["", null, false]}}
+  ],
+  "stop_reason": "tool_use",
+  "usage": {
+    "input_tokens": 18446744073709551615,
+    "output_tokens": 3,
+    "cached_input_tokens": 4,
+    "cache_creation_input_tokens": 0,
+    "reasoning_tokens": 1
+  },
+  "safety": [
+    {
+      "category": "harm",
+      "blocked": true,
+      "extra": {"protocol": "generate_content", "fields": {"reason": "provider policy"}}
+    }
+  ],
+  "extra": {"protocol": "generate_content", "fields": {"native": {"source": "fixture"}}}
+}

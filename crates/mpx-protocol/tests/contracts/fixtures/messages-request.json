@@ -1,0 +1,14 @@
+{
+  "model": "m",
+  "max_tokens": 128,
+  "system": [
+    {
+      "type": "text",
+      "text": "Keep the reply short.",
+      "cache_control": {"type": "ephemeral", "ttl": "5m"},
+      "vendor_nested": {"traces": [{"id": 1}, null]}
+    }
+  ],
+  "messages": [{"role": "user", "content": "Hello 🦉\nSay \"hi\"."}],
+  "vendor_extension": {}
+}

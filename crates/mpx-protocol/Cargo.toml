@@ -5,15 +5,22 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-stream.workspace = true
+base64.workspace = true
+bon.workspace = true
+bytes.workspace = true
+eventsource-stream.workspace = true
 futures-util = { workspace = true, features = ["std"] }
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
 percent-encoding = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sync_wrapper.workspace = true
 thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

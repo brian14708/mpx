@@ -1,0 +1,13 @@
+{
+  "model": "gemini-3.8-flash",
+  "system_instruction": "Be concise.",
+  "store": false,
+  "input": [
+    {"type": "user_input", "content": "Get the forecast."},
+    {"type": "thought", "signature": "opaque"},
+    {"type": "function_call", "name": "weather", "id": "call_1", "arguments": {"place": "Boston"}},
+    {"type": "function_result", "call_id": "call_1", "result": {"temperature": 52}}
+  ],
+  "tools": [{"type": "function", "name": "weather", "parameters": {"type": "object"}}],
+  "generation_config": {"max_output_tokens": 100, "thinking_summaries": "auto", "vendor_option": true}
+}

@@ -1,0 +1,10 @@
+{
+  "model": "m",
+  "messages": [
+    {"role": "developer", "content": "Keep the reply short.", "name": "context", "vendor_nested": [null, false]},
+    {"role": "user", "content": "Hello 🦉\nSay \"hi\"."}
+  ],
+  "stream": false,
+  "stream_options": {"include_usage": false, "vendor_nested": {"labels": []}},
+  "vendor_extension": {"limits": [0, -1, 7], "enabled": false}
+}

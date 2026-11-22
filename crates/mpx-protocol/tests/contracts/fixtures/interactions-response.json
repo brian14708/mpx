@@ -1,0 +1,11 @@
+{
+  "id": "int_1",
+  "object": "interaction",
+  "model": "gemini-3.8-flash",
+  "status": "requires_action",
+  "steps": [
+    {"type":"thought", "signature":"opaque", "summary":[{"type":"text", "text":"Check the forecast."}]},
+    {"type":"function_call", "id":"call_1", "name":"weather", "arguments":{"place":"Boston"}}
+  ],
+  "usage": {"total_input_tokens": 11, "total_cached_tokens": 5, "total_output_tokens": 3, "total_thought_tokens": 2, "total_tokens": 16}
+}

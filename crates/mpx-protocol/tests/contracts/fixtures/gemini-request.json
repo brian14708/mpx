@@ -1,0 +1,7 @@
+{
+  "system_instruction": {"parts": [{"text": "Keep the reply short."}]},
+  "contents": [
+    {"role": "user", "parts": [{"text": "Hello 🦉\nSay \"hi\".", "vendor_nested": {"flags": [true, false]}}]}
+  ],
+  "vendor_extension": null
+}

@@ -1,0 +1,9 @@
+{
+  "model": "m",
+  "store": false,
+  "input": [
+    {"role": "developer", "content": "Keep the reply short.", "vendor_nested": {"labels": []}},
+    {"role": "user", "content": "Hello 🦉\nSay \"hi\"."}
+  ],
+  "vendor_extension": ["", null, {"enabled": true}]
+}

@@ -1,0 +1,5 @@
+data: {"responseId":"gem_1","modelVersion":"m","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hi "}]}}]}
+
+data: {"responseId":"gem_1","modelVersion":"m","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"🦉"}]}}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3}}
+
+data: {"responseId":"gem_1","modelVersion":"m","candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3,"totalTokenCount":14}}
