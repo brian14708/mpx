@@ -4,8 +4,18 @@ use serde_json::{Map, Value};
 
 use crate::{
     ContentBlock, Extra, Message, OutputFormat, ReasoningParams, Response, SamplingParams, Tool,
-    ToolChoice,
+    ToolChoice, json::nonempty,
 };
+
+pub(crate) fn session_id_field(fields: &Map<String, Value>) -> Option<String> {
+    nonempty(fields.get("session_id")?.as_str()?.trim())
+}
+
+pub(crate) fn take_session_id(fields: &mut Map<String, Value>) -> Option<String> {
+    let session_id = session_id_field(fields)?;
+    fields.remove("session_id");
+    Some(session_id)
+}
 
 /// A provider response identifier used for server-side continuation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -72,6 +82,12 @@ pub struct Request {
     /// Provider model identifier.
     #[builder(into)]
     pub model: String,
+    /// Client session identifier, extracted from recognized headers or provider fields.
+    /// `x-session-id` takes precedence over native session headers and body fields.
+    /// `thread-id` is a fallback on Responses requests.
+    #[builder(into)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Leading system/developer content in canonical order.
     #[builder(default)]
     pub instructions: Vec<ContentBlock>,
@@ -111,6 +127,19 @@ pub struct Request {
 }
 
 impl Request {
+    pub(crate) fn openai_metadata(&self) -> Option<Map<String, Value>> {
+        let mut metadata = self.metadata.clone();
+        // OpenAI allows at most 16 entries and 512 characters per value.
+        if let Some(session_id) = &self.session_id
+            && !session_id.is_empty()
+            && session_id.chars().take(513).count() <= 512
+            && (metadata.len() < 16 || metadata.contains_key("session_id"))
+        {
+            metadata.insert("session_id".to_owned(), Value::String(session_id.clone()));
+        }
+        (!metadata.is_empty()).then_some(metadata)
+    }
+
     /// Appends a complete model response as one assistant history message.
     ///
     /// Blocks are cloned without altering seals, extension data, or exact tool

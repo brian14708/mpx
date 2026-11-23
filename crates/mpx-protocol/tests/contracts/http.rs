@@ -1,10 +1,243 @@
-use http::{HeaderValue, header};
+use http::{HeaderName, HeaderValue, header};
 use mpx_protocol::{
     ClientContext, Codec, Endpoint, Extra, Protocol, Response, ResponseBody, StreamEvent,
 };
 use serde_json::{Value, json};
 
 use super::{body, collect_body, request, sse_data};
+
+#[tokio::test]
+async fn session_id_is_decoded_from_the_header() {
+    let codec = Codec::default();
+    let input = json!({"model":"gpt-5","input":"hello"});
+    let raw = || request("/v1/responses", &input);
+    let mut with_session = raw();
+    with_session
+        .headers_mut()
+        .insert("X-Session-Id", HeaderValue::from_static("session-123"));
+
+    let decoded = codec.decode_request(with_session).expect("request decodes");
+    assert_eq!(decoded.body().session_id.as_deref(), Some("session-123"));
+    let normalized = serde_json::to_value(decoded.body()).expect("normalized request serializes");
+    assert_eq!(normalized["session_id"], "session-123");
+    let encoded = codec
+        .encode_request(&decoded, Protocol::Responses)
+        .expect("request encodes");
+    assert!(!encoded.headers().contains_key("x-session-id"));
+    let encoded: Value = serde_json::from_slice(&collect_body(encoded.into_body()).await)
+        .expect("request body is JSON");
+    assert_eq!(encoded["metadata"]["session_id"], "session-123");
+    assert_eq!(encoded["input"], "hello");
+
+    let decoded = codec.decode_request(raw()).expect("request decodes");
+    assert!(decoded.body().session_id.is_none());
+    let normalized = serde_json::to_value(decoded.body()).expect("normalized request serializes");
+    assert!(normalized.get("session_id").is_none());
+
+    for value in [b"".as_slice(), b"   ".as_slice(), b"\xff".as_slice()] {
+        let mut with_unusable_session = raw();
+        with_unusable_session.headers_mut().insert(
+            "x-session-id",
+            HeaderValue::from_bytes(value).expect("valid HTTP header value"),
+        );
+        let decoded = codec
+            .decode_request(with_unusable_session)
+            .expect("request decodes");
+        assert!(decoded.body().session_id.is_none());
+    }
+}
+
+#[test]
+fn session_id_is_decoded_from_native_headers() {
+    let codec = Codec::default();
+    for (path, input, names) in [
+        (
+            "/v1/responses",
+            json!({"model":"m","input":"hello"}),
+            ["session_id", "session-id", "thread-id"].as_slice(),
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"m","max_tokens":8,"messages":[]}),
+            ["x-claude-code-session-id", "claude-code-session-id"].as_slice(),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"m","messages":[]}),
+            ["x-session-affinity", "x-deepseek-harness-session-id"].as_slice(),
+        ),
+    ] {
+        for &name in names {
+            let mut raw = request(path, &input);
+            raw.headers_mut()
+                .insert("x-session-id", HeaderValue::from_static(" "));
+            raw.headers_mut()
+                .insert(name, HeaderValue::from_static(" native-id "));
+            let decoded = codec.decode_request(raw.clone()).expect("request decodes");
+            assert_eq!(
+                decoded.body().session_id.as_deref(),
+                Some("native-id"),
+                "{name}"
+            );
+
+            raw.headers_mut()
+                .append("x-session-id", HeaderValue::from_static("explicit-id"));
+            let decoded = codec.decode_request(raw).expect("request decodes");
+            assert_eq!(
+                decoded.body().session_id.as_deref(),
+                Some("explicit-id"),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_id_is_decoded_from_native_body_context() {
+    let codec = Codec::default();
+    let mut responses = request(
+        "/v1/responses",
+        &json!({"model":"m","input":"hello","client_metadata":{"session_id":"codex"}}),
+    );
+    responses
+        .headers_mut()
+        .insert("thread-id", HeaderValue::from_static("thread"));
+    let decoded = codec
+        .decode_request(responses.clone())
+        .expect("request decodes");
+    assert_eq!(decoded.body().session_id.as_deref(), Some("codex"));
+    let encoded = codec
+        .encode_request(&decoded, Protocol::Responses)
+        .expect("request encodes");
+    assert_eq!(collect_body(encoded.into_body()).await, *responses.body());
+
+    for (metadata, expected) in [
+        (
+            json!({"session_id":"direct","user_id":"user_device_session_legacy"}),
+            Some("direct"),
+        ),
+        (
+            json!({"user_id":r#"{"session_id":"current","device_id":"device"}"#}),
+            Some("current"),
+        ),
+        (
+            json!({"user_id":"user_device_account__session_legacy"}),
+            Some("legacy"),
+        ),
+        (
+            json!({"user_id":r#"{"session_id":false,"device_id":"user_device_session_bad"}"#}),
+            None,
+        ),
+        (json!({"user_id":"customer-123"}), None),
+    ] {
+        let raw = request(
+            "/v1/messages",
+            &json!({"model":"m","max_tokens":8,"messages":[],"metadata":metadata}),
+        );
+        let decoded = codec.decode_request(raw.clone()).expect("request decodes");
+        assert_eq!(decoded.body().session_id.as_deref(), expected);
+        let encoded = codec
+            .encode_request(&decoded, Protocol::Messages)
+            .expect("request encodes");
+        assert_eq!(collect_body(encoded.into_body()).await, *raw.body());
+    }
+}
+
+#[tokio::test]
+async fn session_ids_round_trip_through_provider_bodies() {
+    let codec = Codec::default();
+    for (protocol, path, pointer, input) in [
+        (
+            Protocol::ChatCompletions,
+            "/v1/chat/completions",
+            "/metadata",
+            json!({"model":"m","messages":[],"metadata":{"session_id":"wire-id","other":"keep"}}),
+        ),
+        (
+            Protocol::Responses,
+            "/v1/responses",
+            "/metadata",
+            json!({"model":"m","input":"hello","metadata":{"session_id":"wire-id","other":"keep"}}),
+        ),
+        (
+            Protocol::GenerateContent,
+            "/v1beta/models/gemini-2:generateContent",
+            "/labels",
+            json!({"labels":{"session_id":"wire-id","other":"keep"}}),
+        ),
+        (
+            Protocol::Interactions,
+            "/v1beta/interactions",
+            "/webhook_config/user_metadata",
+            json!({"model":"m","input":"hello","webhook_config":{"user_metadata":{"session_id":"wire-id","other":"keep"}}}),
+        ),
+    ] {
+        let raw = || request(path, &input);
+        let decoded = codec.decode_request(raw()).expect("request decodes");
+        assert_eq!(decoded.body().session_id.as_deref(), Some("wire-id"));
+        let unchanged = codec
+            .encode_request(&decoded, protocol)
+            .expect("request encodes");
+        assert_eq!(collect_body(unchanged.into_body()).await, *raw().body());
+
+        let mut with_header = raw();
+        with_header
+            .headers_mut()
+            .insert("x-session-id", HeaderValue::from_static("header-id"));
+        let mut decoded = codec.decode_request(with_header).expect("request decodes");
+        assert_eq!(decoded.body().session_id.as_deref(), Some("header-id"));
+
+        let encoded = codec
+            .encode_request(&decoded, protocol)
+            .expect("request encodes");
+        let encoded: Value = serde_json::from_slice(&collect_body(encoded.into_body()).await)
+            .expect("request body is JSON");
+        let metadata = encoded.pointer(pointer).expect("wire carries metadata");
+        assert_eq!(metadata["session_id"], "header-id");
+        assert_eq!(metadata["other"], "keep");
+
+        decoded.body_mut().session_id = None;
+        let encoded = codec
+            .encode_request(&decoded, protocol)
+            .expect("request encodes");
+        let encoded: Value = serde_json::from_slice(&collect_body(encoded.into_body()).await)
+            .expect("request body is JSON");
+        let metadata = encoded.pointer(pointer).expect("wire carries metadata");
+        assert_eq!(metadata, &json!({"other":"keep"}));
+    }
+}
+
+#[tokio::test]
+async fn configured_session_header_uses_the_normalized_id() {
+    let name = HeaderName::from_static("x-session-id");
+    let codec = Codec::builder().forward_header(name.clone()).build();
+    let raw = request(
+        "/v1/responses",
+        &json!({"model":"m","input":"hello","metadata":{"session_id":"wire-id"}}),
+    );
+    let mut decoded = codec.decode_request(raw).expect("request decodes");
+    let encoded = codec
+        .encode_request(&decoded, Protocol::GenerateContent)
+        .expect("Gemini request encodes");
+    assert_eq!(encoded.headers()[&name], "wire-id");
+    let encoded: Value = serde_json::from_slice(&collect_body(encoded.into_body()).await)
+        .expect("request body is JSON");
+    assert_eq!(encoded["labels"]["session_id"], "wire-id");
+
+    let encoded = codec
+        .encode_request(&decoded, Protocol::Messages)
+        .expect("request encodes");
+    assert_eq!(encoded.headers()[&name], "wire-id");
+    let encoded: Value = serde_json::from_slice(&collect_body(encoded.into_body()).await)
+        .expect("request body is JSON");
+    assert!(encoded.get("metadata").is_none());
+
+    decoded.body_mut().session_id = None;
+    let encoded = codec
+        .encode_request(&decoded, Protocol::Messages)
+        .expect("request encodes");
+    assert!(!encoded.headers().contains_key(name));
+}
 
 #[tokio::test]
 async fn encoded_requests_strip_credentials_queries_and_hop_by_hop_headers() {

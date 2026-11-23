@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{StatusCode, header};
 use serde_json::{Map, Value, json};
 
-use crate::json::{insert_option, merge_missing, take_object};
+use crate::json::{insert_option, merge_missing, nonempty, take_object};
 use crate::{
     ApiError, ApiErrorKind, ClientContext, CodecContext, ContentBlock, DiagnosticKind, Endpoint,
     Error, Extra, MediaSource, Message, OutputFormat, OutputFormatKind, Protocol, ProtocolCodec,
@@ -16,6 +16,7 @@ use crate::{
         wire::{self, MessagesRequest, MessagesResponse, WireMessage, WireUsage},
     },
     codec::json_response,
+    request::session_id_field,
     response::normalize_tool_stop_reason,
     tool::synthesized_tool_call_id,
 };
@@ -23,6 +24,23 @@ use crate::{
 /// Sans-IO codec for Anthropic Messages.
 #[derive(Debug, Clone)]
 pub(crate) struct MessagesCodec;
+
+fn claude_session_id(user_id: &Value) -> Option<String> {
+    if let Some(fields) = user_id.as_object() {
+        return session_id_field(fields);
+    }
+    let user_id = user_id.as_str()?.trim();
+    if user_id.starts_with('{') {
+        let fields = serde_json::from_str(user_id).ok()?;
+        return session_id_field(&fields);
+    }
+    // Older Claude Code clients append the session ID to the user identifier.
+    let (user, session_id) = user_id.strip_prefix("user_")?.rsplit_once("_session_")?;
+    if user.is_empty() {
+        return None;
+    }
+    nonempty(session_id.trim())
+}
 
 impl ProtocolCodec for MessagesCodec {
     fn protocol(&self) -> Protocol {
@@ -86,8 +104,12 @@ impl ProtocolCodec for MessagesCodec {
         if instructions.is_empty() {
             instructions = Vec::new();
         }
+        let metadata = wire.metadata.unwrap_or_default();
+        let session_id = session_id_field(&metadata)
+            .or_else(|| metadata.get("user_id").and_then(claude_session_id));
         Ok(Request {
             model: wire.model,
+            session_id,
             instructions,
             messages,
             tools,
@@ -108,7 +130,7 @@ impl ProtocolCodec for MessagesCodec {
             output_format,
             parallel_tool_calls: parallel_from_choice,
             stream: wire.stream.unwrap_or(false),
-            metadata: wire.metadata.unwrap_or_default(),
+            metadata,
             continuation: None,
             extra: wire::extra_fields(extra),
             client_include_usage: false,

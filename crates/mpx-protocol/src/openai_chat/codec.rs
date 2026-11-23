@@ -11,7 +11,7 @@ use crate::{
     Endpoint, Error, Extra, MediaSource, Message, OutputFormat, OutputFormatKind, Protocol,
     ProtocolCodec, ReasoningParams, Request, Response, Result, Role, SamplingParams, StopReason,
     Tool, ToolArguments, ToolCallId, ToolChoice, Usage, codec::json_response,
-    tool::synthesized_tool_call_id,
+    request::take_session_id, tool::synthesized_tool_call_id,
 };
 
 use super::{
@@ -26,8 +26,6 @@ use super::{
 };
 
 const URI: &str = "/v1/chat/completions";
-const MESSAGE_EXTRA: &str = "__mpx_chat_message_extra";
-const CHOICE_EXTRA: &str = "__mpx_chat_choice_extra";
 
 impl ProtocolCodec for ChatCompletionsCodec {
     fn protocol(&self) -> Protocol {
@@ -78,8 +76,11 @@ impl ProtocolCodec for ChatCompletionsCodec {
             Some(StopWire::Many(stops)) => stops,
             None => Vec::new(),
         };
+        let mut metadata = wire.metadata.unwrap_or_default();
+        let session_id = take_session_id(&mut metadata);
         Ok(Request {
             model,
+            session_id,
             instructions,
             messages,
             tools,
@@ -101,7 +102,7 @@ impl ProtocolCodec for ChatCompletionsCodec {
             output_format,
             parallel_tool_calls: wire.parallel_tool_calls,
             stream: wire.stream.unwrap_or(false) || endpoint.stream,
-            metadata: wire.metadata.unwrap_or_default(),
+            metadata,
             continuation: None,
             extra: make_extra(wire.extra),
             client_include_usage: wire
@@ -191,7 +192,7 @@ impl ProtocolCodec for ChatCompletionsCodec {
             response_format,
             reasoning_effort,
             reasoning,
-            metadata: (!req.metadata.is_empty()).then(|| req.metadata.clone()),
+            metadata: req.openai_metadata(),
             extra,
         };
         let body = to_bytes(&wire)?;
@@ -246,10 +247,13 @@ impl ProtocolCodec for ChatCompletionsCodec {
             extra.insert("created".to_owned(), Value::from(created));
         }
         if let Some(message_extra) = message.extra {
-            insert_internal_extra(&mut extra, MESSAGE_EXTRA, message_extra);
+            insert_internal_extra(&mut extra, "__mpx_chat_message_extra", message_extra);
         }
         if !choice.extra.is_empty() {
-            extra.insert(CHOICE_EXTRA.to_owned(), Value::Object(choice.extra));
+            extra.insert(
+                "__mpx_chat_choice_extra".to_owned(),
+                Value::Object(choice.extra),
+            );
         }
         Ok(Response {
             id: wire.id,
@@ -293,10 +297,11 @@ impl ProtocolCodec for ChatCompletionsCodec {
     ) -> Result<http::Response<Bytes>> {
         let mut message = encode_response_message(&response.content, cx)?;
         let mut extra = same_extra(response.extra.as_ref(), cx, "extra")?;
-        if let Some(fields) = take_internal_extra(&mut extra, MESSAGE_EXTRA) {
+        if let Some(fields) = take_internal_extra(&mut extra, "__mpx_chat_message_extra") {
             message.extra = fields;
         }
-        let choice_extra = take_internal_extra(&mut extra, CHOICE_EXTRA).unwrap_or_default();
+        let choice_extra =
+            take_internal_extra(&mut extra, "__mpx_chat_choice_extra").unwrap_or_default();
         let created = extra
             .remove("created")
             .and_then(|value| value.as_u64())

@@ -192,13 +192,8 @@ impl AliasTemplate {
         }))
     }
 
-    pub(crate) fn select(&self, value: &str, output: &mut String) -> bool {
-        self.render_seed(&Sha256::digest(value.as_bytes()).into(), output)
-    }
-
-    fn render_seed(&self, digest: &[u8; 32], output: &mut String) -> bool {
+    pub(crate) fn select(&self, digest: &[u8; 32], output: &mut String) -> bool {
         let mut hash = Sha256::new();
-        hash.update(b"mpx-redact/v1/alias\0");
         hash.update(&digest[..8]);
         hash.update(self.kind.as_bytes());
         output.clear();
@@ -214,14 +209,13 @@ impl AliasTemplate {
 
     pub(crate) fn select_available(
         &self,
-        value: &str,
+        digest: &[u8; 32],
         output: &mut String,
         mut available: impl FnMut(&str) -> bool,
         strict: bool,
     ) -> Result<bool, u128> {
-        let digest: [u8; 32] = Sha256::digest(value.as_bytes()).into();
         let mut attempts: u128 = 1;
-        if self.render_seed(&digest, output) && available(output) {
+        if self.select(digest, output) && available(output) {
             return Ok(false);
         }
         if strict {

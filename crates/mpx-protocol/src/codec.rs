@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http::{HeaderName, HeaderValue, StatusCode, header};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use http_body::{Body as HttpBody, Frame};
 use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody, combinators::BoxBody};
 use serde_json::Value;
@@ -14,6 +14,7 @@ use crate::{
     anthropic_messages::MessagesCodec,
     gemini::GenerateContentCodec,
     interactions::InteractionsCodec,
+    json::nonempty,
     openai_chat::ChatCompletionsCodec,
     openai_responses::ResponsesCodec,
     protocol_codec::{CodecOptions, copy_header, is_forbidden_header},
@@ -25,6 +26,26 @@ use crate::{
 
 /// HTTP body type returned by [`Codec`] response encoders.
 pub type Body = BoxBody<Bytes, Error>;
+
+fn session_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| nonempty(value.trim()))
+}
+
+fn request_session_header(headers: &HeaderMap, protocol: Protocol) -> Option<String> {
+    let native_headers: &[&str] = match protocol {
+        Protocol::Responses | Protocol::ChatCompletions => &["session_id", "session-id"],
+        Protocol::Messages => &["x-claude-code-session-id", "claude-code-session-id"],
+        _ => &[],
+    };
+    std::iter::once("x-session-id")
+        .chain(native_headers.iter().copied())
+        .chain(["x-session-affinity", "x-deepseek-harness-session-id"])
+        .find_map(|name| session_header(headers, name))
+}
 
 #[derive(Clone)]
 struct OriginalBody<T> {
@@ -133,6 +154,13 @@ impl Codec {
             body,
             value: Arc::new(decoded.clone()),
         });
+        // Preserve the body-derived ID in the replay baseline so a header override reaches the wire.
+        decoded.session_id = request_session_header(&parts.headers, client.endpoint.protocol)
+            .or(decoded.session_id)
+            .or_else(|| match client.endpoint.protocol {
+                Protocol::Responses => session_header(&parts.headers, "thread-id"),
+                _ => None,
+            });
         parts.extensions.insert(client);
         parts.extensions.insert(diagnostics);
         Ok(http::Request::from_parts(parts, decoded))
@@ -207,11 +235,11 @@ impl Codec {
                     options.loss_policy = LossPolicy::Warn;
                     let baseline = CodecContext::new(Arc::new(options), Diagnostics::new());
                     if let Ok(previous) = codec.encode_request(&original.value, &baseline) {
-                        *encoded.body_mut() = preserve_original_json(
-                            &original.body,
-                            previous.body(),
-                            encoded.body(),
-                        )?;
+                        *encoded.body_mut() = if previous.body() == encoded.body() {
+                            original.body.clone()
+                        } else {
+                            preserve_original_json(&original.body, previous.body(), encoded.body())?
+                        };
                     }
                 }
             }
@@ -224,6 +252,21 @@ impl Codec {
                 encoded.headers_mut(),
                 &self.inner.options.forward_headers,
             );
+        }
+        let session_header = HeaderName::from_static("x-session-id");
+        if self.inner.options.forward_headers.contains(&session_header) {
+            let session_id = request
+                .body()
+                .session_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .and_then(|value| HeaderValue::from_str(value).ok())
+                .filter(|value| value.to_str().is_ok());
+            if let Some(session_id) = session_id {
+                encoded.headers_mut().insert(session_header, session_id);
+            } else {
+                encoded.headers_mut().remove(session_header);
+            }
         }
         encoded.extensions_mut().insert(endpoint);
         encoded.extensions_mut().insert(diagnostics);
@@ -665,6 +708,7 @@ impl CodecBuilder {
     }
 
     /// Adds a non-credential header to the upstream forwarding allowlist.
+    /// For `x-session-id`, the outgoing value comes from [`Request::session_id`].
     #[must_use]
     pub fn forward_header(mut self, name: HeaderName) -> Self {
         if !is_forbidden_header(name.as_str()) {

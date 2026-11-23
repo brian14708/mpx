@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     CodecContext, ContentBlock, Continuation, DiagnosticKind, Endpoint, Error, Message,
     OutputFormat, OutputFormatKind, ReasoningParams, Request, Result, Role, SamplingParams, Tool,
-    ToolChoice, json::insert_option,
+    ToolChoice, json::insert_option, request::take_session_id,
 };
 
 use super::{
@@ -91,8 +91,15 @@ pub(super) fn decode(endpoint: &Endpoint, body: &[u8]) -> Result<Request> {
         .and_then(|value| value.as_bool())
         .unwrap_or_default();
     let metadata = crate::json::take_object(&mut fields, "user_metadata");
+    let session_id = fields
+        .get_mut("webhook_config")
+        .and_then(Value::as_object_mut)
+        .and_then(|config| config.get_mut("user_metadata"))
+        .and_then(Value::as_object_mut)
+        .and_then(take_session_id);
     Ok(Request {
         model,
+        session_id,
         instructions,
         messages,
         tools,
@@ -257,6 +264,18 @@ pub(super) fn encode(req: &Request, cx: &CodecContext) -> Result<Map<String, Val
     }
     if !req.metadata.is_empty() {
         wire.insert("user_metadata".to_owned(), json!(req.metadata));
+    }
+    if let Some(session_id) = &req.session_id
+        && !session_id.is_empty()
+        && let Some(config) = wire
+            .get_mut("webhook_config")
+            .and_then(Value::as_object_mut)
+        && let Some(metadata) = config
+            .entry("user_metadata")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+    {
+        metadata.insert("session_id".to_owned(), Value::String(session_id.clone()));
     }
     let mut instructions = Vec::new();
     append_instructions(&req.instructions, &mut instructions, cx)?;

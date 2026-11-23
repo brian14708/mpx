@@ -7,7 +7,7 @@ use crate::{
     ApiError, ApiErrorKind, CodecContext, ContentBlock, DiagnosticKind, Endpoint, Error, Extra,
     MediaSource, Message, OutputFormat, OutputFormatKind, Protocol, ReasoningParams, ReasoningSeal,
     Request, Response, Result, Role, SafetyRating, SamplingParams, StopReason, Tool, ToolArguments,
-    ToolCallId, ToolChoice, Usage,
+    ToolCallId, ToolChoice, Usage, request::take_session_id,
 };
 
 use super::wire::{
@@ -56,8 +56,17 @@ pub(super) fn decode_request(
         .clone()
         .or(wire.model)
         .unwrap_or_default();
+    let mut extra = wire.extra;
+    let session_id = extra
+        .get_mut("labels")
+        .and_then(Value::as_object_mut)
+        .and_then(take_session_id);
+    if session_id.is_some() && extra["labels"].as_object().is_some_and(Map::is_empty) {
+        extra.remove("labels");
+    }
     Ok(Request {
         model,
+        session_id,
         instructions,
         messages,
         tools,
@@ -69,7 +78,7 @@ pub(super) fn decode_request(
         stream: endpoint.stream,
         metadata: Map::new(),
         continuation: None,
-        extra: make_extra(wire.extra),
+        extra: make_extra(extra),
         client_include_usage: false,
         messages_max_tokens: false,
     })
@@ -169,6 +178,15 @@ pub(super) fn encode_request(req: &Request, cx: &CodecContext) -> Result<Generat
     };
     let generation_config = encode_generation_config(req, cx)?;
     let mut extra = take_extra(req.extra.as_ref(), cx, "extra")?;
+    if let Some(session_id) = &req.session_id
+        && is_label_value(session_id)
+        && let Some(labels) = extra
+            .entry("labels")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+    {
+        labels.insert("session_id".to_owned(), Value::String(session_id.clone()));
+    }
     // A model field is not normally present in a Gemini request. Retain one
     // supplied by same-protocol extensions, but use the path as the authority.
     let model = extra.remove("model").and_then(|value| {
@@ -191,6 +209,16 @@ pub(super) fn encode_request(req: &Request, cx: &CodecContext) -> Result<Generat
         model,
         extra,
     })
+}
+
+fn is_label_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().take(64).count() <= 63
+        && value.chars().all(|character| {
+            (character.is_alphabetic() && !character.is_uppercase())
+                || character.is_numeric()
+                || matches!(character, '_' | '-')
+        })
 }
 
 fn endpoint_model_is_useful(value: &Value) -> bool {

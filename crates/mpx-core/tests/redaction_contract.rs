@@ -38,6 +38,283 @@ fn gateway<T>(
 }
 
 #[tokio::test]
+async fn session_id_scopes_redaction_markers_and_aliases() {
+    let rules = Rules::new([
+        Rule::new(Matcher::Literal(SECRET.into()), Mask::tag()),
+        Rule::new(
+            Matcher::Email,
+            Mask::alias(
+                "email",
+                "{{hex}}@example.com",
+                &[GeneratorBinding::new("hex", Hex(16))],
+            )
+            .unwrap(),
+        ),
+    ]);
+    let transport = service_fn(|request: Request<Body>| async move {
+        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = body["messages"][0]["content"].as_str().unwrap();
+        Ok::<_, mpx_protocol::BoxError>(echo(text, false))
+    });
+    let gateway = gateway(
+        transport,
+        RedactionLayer::new(rules)
+            .with_hmac_key(b"gateway-test-secret")
+            .with_replacement_map(),
+        Protocol::ChatCompletions,
+    );
+    let send = |session_id: &str| {
+        let gateway = gateway.clone();
+        let text = format!("{SECRET}, alice@corp.test");
+        let request = Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-session-id", session_id)
+            .body(Full::new(Bytes::from(
+                json!({"model":"gpt-5","messages":[{"role":"user","content":text}]}).to_string(),
+            )))
+            .unwrap();
+        async move {
+            let response = gateway.oneshot(request).await.unwrap();
+            let replacements = response.extensions().get::<ReplacementMap>().unwrap();
+            let issued = [SECRET, "alice@corp.test"].map(|value| {
+                replacements
+                    .entries()
+                    .find_map(|(replacement, original)| {
+                        (original == value).then(|| replacement.to_owned())
+                    })
+                    .unwrap()
+            });
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["choices"][0]["message"]["content"],
+                format!("echo {text}")
+            );
+            issued
+        }
+    };
+    let [marker, alias] = send("session-a").await;
+    let expected_marker = RedactionSession::new()
+        .with_hmac_key(b"gateway-test-secret")
+        .with_scope("session-a")
+        .mask(
+            SECRET,
+            &Rules::new([Rule::new(Matcher::Literal(SECRET.into()), Mask::tag())]),
+        )
+        .unwrap();
+    assert_eq!(marker, expected_marker);
+    assert_eq!(send("session-a").await, [marker.clone(), alias.clone()]);
+    let [other_marker, other_alias] = send("session-b").await;
+    assert_ne!(marker, other_marker);
+    assert_ne!(alias, other_alias);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn redacts_structured_tool_fields_and_restores_streamed_arguments() {
+    for upstream_streams in [false, true] {
+        let transport = service_fn(move |request: Request<Body>| async move {
+            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let encoded = body.to_string();
+            assert!(!encoded.contains("alice@example.org"), "{encoded}");
+            let arguments = body["messages"][1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap();
+            let arguments_value: Value = serde_json::from_str(arguments).unwrap();
+            assert!(
+                arguments_value["email"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("<|mpx-redact-"))
+            );
+
+            if upstream_streams {
+                let split = arguments.len() / 2;
+                let first = &arguments[..split];
+                let second = &arguments[split..];
+                let frames = [
+                    json!({
+                        "id": "tool-stream",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "gpt-5",
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call-2", "type": "function", "function": {"name": "lookup", "arguments": first}}]}, "finish_reason": null}]
+                    }),
+                    json!({
+                        "id": "tool-stream",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "gpt-5",
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": second}}]}, "finish_reason": null}]
+                    }),
+                    json!({
+                        "id": "tool-stream",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "gpt-5",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                    }),
+                ];
+                let mut payload = String::new();
+                for frame in frames {
+                    write!(&mut payload, "data: {frame}\n\n").unwrap();
+                }
+                payload.push_str("data: [DONE]\n\n");
+                Ok::<_, mpx_protocol::BoxError>(
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Full::new(Bytes::from(payload)))
+                        .unwrap(),
+                )
+            } else {
+                Ok::<_, mpx_protocol::BoxError>(
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from(
+                            json!({
+                                "id": "tool-response",
+                                "object": "chat.completion",
+                                "created": 0,
+                                "model": "gpt-5",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "lookup", "arguments": arguments}}]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }]
+                            })
+                            .to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        });
+        let rules = Rules::new([Rule::new(Matcher::Email, Mask::tag())]);
+        let gateway = gateway(
+            transport,
+            RedactionLayer::new(rules).with_hmac_key(b"gateway-test-secret"),
+            Protocol::ChatCompletions,
+        );
+        let request = Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(
+                json!({
+                    "model": "gpt-5",
+                    "stream": upstream_streams,
+                    "metadata": {"contact": "alice@example.org"},
+                    "tools": [{"type": "function", "function": {
+                        "name": "lookup",
+                        "description": "Contact alice@example.org",
+                        "parameters": {"type": "object", "properties": {"email": {"type": "string", "description": "alice@example.org"}}}
+                    }}],
+                    "messages": [
+                        {"role": "user", "content": "alice@example.org"},
+                        {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{\"email\":\"alice@example.org\"}"}}]},
+                        {"role": "tool", "tool_call_id": "call-1", "content": "alice@example.org"}
+                    ]
+                })
+                .to_string(),
+            )))
+            .unwrap();
+        let response = gateway.oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if upstream_streams {
+            assert_eq!(
+                streamed_tool_arguments(std::str::from_utf8(&body).unwrap()),
+                r#"{"email":"alice@example.org"}"#
+            );
+        } else {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                r#"{"email":"alice@example.org"}"#
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn zero_hit_redaction_preserves_gemini_request_replay() {
+    let transport = service_fn(|request: Request<Body>| async move {
+        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["response"]["sibling"],
+            "keep"
+        );
+        Ok::<_, mpx_protocol::BoxError>(
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}]}"#,
+                )))
+                .unwrap(),
+        )
+    });
+    let rules = Rules::new([Rule::new(Matcher::Email, Mask::tag())]);
+    let gateway = gateway(
+        transport,
+        RedactionLayer::new(rules).with_hmac_key(b"gateway-test-secret"),
+        Protocol::GenerateContent,
+    );
+    let request = Request::post("/v1beta/models/gemini-2:generateContent")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(
+            br#"{"contents":[{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"id":"call-1","name":"lookup","response":{"output":"safe","sibling":"keep"}}}]}]}"#,
+        )))
+        .unwrap();
+    let response = gateway.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn masking_structured_tool_result_keeps_json_siblings() {
+    let transport = service_fn(|request: Request<Body>| async move {
+        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["response"],
+            json!({"output": "\"", "sibling": "keep"})
+        );
+        Ok::<_, mpx_protocol::BoxError>(
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}]}"#,
+                )))
+                .unwrap(),
+        )
+    });
+    let rules = Rules::new([Rule::new(
+        Matcher::Literal("secret".into()),
+        Mask::literal("\""),
+    )]);
+    let gateway = gateway(
+        transport,
+        RedactionLayer::new(rules).with_hmac_key(b"gateway-test-secret"),
+        Protocol::GenerateContent,
+    );
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            json!({
+                "model": "gpt-5",
+                "messages": [
+                    {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "{\"output\":\"secret\",\"sibling\":\"keep\"}"}
+                ]
+            })
+            .to_string(),
+        )))
+        .unwrap();
+    let response = gateway.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn aliases_and_fallback_tags_round_trip_through_sse() {
     let transport = service_fn(|request: Request<Body>| async move {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
@@ -337,6 +614,18 @@ fn streamed_text(body: &str) -> String {
         .filter_map(|line| {
             let value: Value = serde_json::from_str(line.strip_prefix("data: ")?).ok()?;
             value["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn streamed_tool_arguments(body: &str) -> String {
+    body.lines()
+        .filter_map(|line| {
+            let data = line.strip_prefix("data: ")?;
+            let value: Value = serde_json::from_str(data).ok()?;
+            value["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
                 .as_str()
                 .map(str::to_owned)
         })

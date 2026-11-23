@@ -97,6 +97,35 @@ fn aliases_and_placeholders_use_explicit_generator_bindings() {
 }
 
 #[test]
+fn keyed_replacements_are_stable_within_a_scope() {
+    let rules = tagged(Matcher::Literal("secret".into()));
+    let first = RedactionSession::new()
+        .with_hmac_key(b"gateway-secret")
+        .with_scope("session-a")
+        .mask("secret", &rules)
+        .unwrap();
+    let repeat = RedactionSession::new()
+        .with_hmac_key(b"gateway-secret")
+        .with_scope("session-a")
+        .mask("secret", &rules)
+        .unwrap();
+    let other_scope = RedactionSession::new()
+        .with_hmac_key(b"gateway-secret")
+        .with_scope("session-b")
+        .mask("secret", &rules)
+        .unwrap();
+    let other_key = RedactionSession::new()
+        .with_hmac_key(b"other-secret")
+        .with_scope("session-a")
+        .mask("secret", &rules)
+        .unwrap();
+
+    assert_eq!(first, repeat);
+    assert_ne!(first, other_scope);
+    assert_ne!(first, other_key);
+}
+
+#[test]
 fn custom_generators_reserve_values_and_probe_collisions() {
     let (alias, template) = {
         let name = String::from("region");

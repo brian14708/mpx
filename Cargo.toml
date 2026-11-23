@@ -15,6 +15,7 @@ bytes = "1"
 criterion = { version = "0.8", default-features = false }
 eventsource-stream = "0.2.3"
 futures-util = { version = "0.3", default-features = false }
+hmac = "0.12"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

@@ -4,16 +4,23 @@ use std::{
     ops::Range,
 };
 
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
 use crate::{
     Error, PlaceholderTemplate, ReplacementMap, Restorer, Rules,
     rules::{self, RuleMatch},
     template::joins_value,
 };
 
+const DERIVATION_CONTEXT: &[u8] = b"mpx-redact/v1\0";
+
 /// Masks text and keeps the reversible replacements for one exchange.
 #[derive(Default)]
 pub struct RedactionSession {
     template: PlaceholderTemplate,
+    hmac: Option<Hmac<Sha256>>,
+    scope: Vec<u8>,
     strict: bool,
     probes: u64,
     reserved: HashSet<String>,
@@ -37,6 +44,24 @@ impl RedactionSession {
     #[must_use]
     pub fn with_placeholder_template(mut self, template: PlaceholderTemplate) -> Self {
         self.template = template;
+        self
+    }
+
+    /// Seeds generated aliases and markers with HMAC-SHA-256 using the supplied secret key.
+    #[must_use]
+    #[expect(clippy::missing_panics_doc, reason = "HMAC accepts keys of any length")]
+    pub fn with_hmac_key(mut self, key: &[u8]) -> Self {
+        self.hmac = Some(Hmac::new_from_slice(key).expect("HMAC accepts any key length"));
+        self
+    }
+
+    /// Scopes keyed replacements to the supplied context.
+    ///
+    /// The scope is included in the versioned HMAC input and may be visible to
+    /// the upstream provider. Keep the HMAC key secret.
+    #[must_use]
+    pub fn with_scope(mut self, scope: impl AsRef<[u8]>) -> Self {
+        scope.as_ref().clone_into(&mut self.scope);
         self
     }
 
@@ -131,6 +156,20 @@ impl RedactionSession {
         Restorer::new(self.replacement_map())
     }
 
+    fn replacement_seed(&self, value: &str) -> [u8; 32] {
+        self.hmac.clone().map_or_else(
+            || Sha256::digest(value.as_bytes()).into(),
+            |mut hmac| {
+                hmac.update(DERIVATION_CONTEXT);
+                hmac.update(&(self.scope.len() as u64).to_be_bytes());
+                hmac.update(&self.scope);
+                hmac.update(&(value.len() as u64).to_be_bytes());
+                hmac.update(value.as_bytes());
+                hmac.finalize().into_bytes().into()
+            },
+        )
+    }
+
     fn replace(&mut self, text: &str, spans: Vec<RuleMatch<'_>>) -> Result<String, Error> {
         let mut pending = BTreeMap::new();
         let mut replacement = String::new();
@@ -140,6 +179,7 @@ impl RedactionSession {
                 return Ok(());
             }
             let value = &text[matched.span.clone()];
+            let seed = self.replacement_seed(value);
             let after = &text[matched.span.end..];
             let mut new_replacement = false;
             let mut alias_conflict = false;
@@ -161,7 +201,7 @@ impl RedactionSession {
                     && next.is_none_or(|start| {
                         start > matched.span.end + usize::from(after.starts_with('.'))
                     });
-                if !valid_position || !template.select(value, &mut replacement) {
+                if !valid_position || !template.select(&seed, &mut replacement) {
                     return false;
                 }
                 if available(&replacement) {
@@ -183,7 +223,7 @@ impl RedactionSession {
                 false
             } else {
                 match self.template.compiled.select_available(
-                    value,
+                    &seed,
                     &mut replacement,
                     available,
                     self.strict,
@@ -241,7 +281,8 @@ mod tests {
     fn keeps_originals_distinct_when_replacements_collide() {
         let mut exchange = RedactionSession::new();
         let mut old = String::new();
-        assert!(exchange.template.compiled.select("new", &mut old));
+        let seed = exchange.replacement_seed("new");
+        assert!(exchange.template.compiled.select(&seed, &mut old));
         exchange.replacements.extend(
             BTreeMap::from([(old.clone(), "old".to_owned())]),
             &exchange.template.compiled.prefix,
@@ -364,7 +405,7 @@ mod tests {
             let mut exchange = RedactionSession::new();
             let original = "alice@corp.test, bob@corp.test";
             let masked = exchange.mask(original, &rules).unwrap();
-            assert_eq!(masked, "willow-birch@example.com, maple-birch@example.com");
+            assert_eq!(masked, "cedar-maple@example.com, willow-willow@example.com");
             assert_eq!(exchange.restore(&masked), original);
         }
     }

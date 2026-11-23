@@ -14,6 +14,7 @@ use crate::{
         stream::{ResponsesStreamDecoder, ResponsesStreamEncoder},
         wire::{self, ResponsesRequest, ResponsesUsage},
     },
+    request::{session_id_field, take_session_id},
     response::normalize_tool_stop_reason,
     tool::synthesized_tool_call_id,
 };
@@ -74,8 +75,16 @@ impl ProtocolCodec for ResponsesCodec {
         if !text_extra.is_empty() {
             extra.insert("text".to_owned(), Value::Object(text_extra));
         }
+        let mut metadata = wire.metadata.unwrap_or_default();
+        let session_id = take_session_id(&mut metadata).or_else(|| {
+            extra
+                .get("client_metadata")
+                .and_then(Value::as_object)
+                .and_then(session_id_field)
+        });
         Ok(Request {
             model: wire.model,
+            session_id,
             instructions,
             messages,
             tools,
@@ -90,7 +99,7 @@ impl ProtocolCodec for ResponsesCodec {
             output_format,
             parallel_tool_calls: wire.parallel_tool_calls,
             stream: wire.stream.unwrap_or(false),
-            metadata: wire.metadata.unwrap_or_default(),
+            metadata,
             continuation: wire.previous_response_id.map(|id| Continuation {
                 previous_response_id: ResponseId::new(id),
                 store: wire.store,
@@ -145,9 +154,11 @@ impl ProtocolCodec for ResponsesCodec {
             "parallel_tool_calls",
             req.parallel_tool_calls.map(Value::Bool),
         );
-        if !req.metadata.is_empty() {
-            object.insert("metadata".to_owned(), Value::Object(req.metadata.clone()));
-        }
+        insert_option(
+            &mut object,
+            "metadata",
+            req.openai_metadata().map(Value::Object),
+        );
         if let Some(continuation) = &req.continuation {
             object.insert(
                 "previous_response_id".to_owned(),
