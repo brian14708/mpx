@@ -138,6 +138,13 @@ impl Codec {
         Ok(http::Request::from_parts(parts, decoded))
     }
 
+    /// Discards the original wire body so encoding uses the edited request.
+    ///
+    /// Use this on normalized routes. Passthrough routes require their original bytes.
+    pub fn disable_request_replay(request: &mut http::Request<Request>) {
+        request.extensions_mut().remove::<OriginalBody<Request>>();
+    }
+
     /// Encodes an IR request for a selected upstream protocol.
     ///
     /// The request is borrowed so retry and continuation layers can amend and
@@ -403,6 +410,14 @@ impl Codec {
                 Ok(stream_response(parts, body))
             }
         }
+    }
+
+    /// Discards wire body snapshots so encoding uses the edited response or events.
+    pub fn disable_response_replay(response: &mut http::Response<ResponseBody>) {
+        let extensions = response.extensions_mut();
+        extensions.remove::<OriginalBody<crate::Response>>();
+        extensions.remove::<OriginalBody<ApiError>>();
+        extensions.remove::<BufferedResponse>();
     }
 
     /// Encodes an error in a selected protocol, useful at ingress boundaries.

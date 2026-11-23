@@ -128,7 +128,10 @@ impl Request {
     }
 }
 
-fn visit_slice(blocks: &mut [ContentBlock], visitor: &mut impl FnMut(&mut ContentBlock)) {
+pub(crate) fn visit_slice(
+    blocks: &mut [ContentBlock],
+    visitor: &mut impl FnMut(&mut ContentBlock),
+) {
     for block in blocks {
         visitor(block);
         if let ContentBlock::ToolResult { content, .. } = block {

@@ -286,6 +286,11 @@ pub enum ContentBlock {
 }
 
 impl ContentBlock {
+    /// Visits this block and every nested tool-result block.
+    pub fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut Self)) {
+        crate::request::visit_slice(std::slice::from_mut(self), visitor);
+    }
+
     /// Creates a text block with no extension fields.
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text {

@@ -1,0 +1,16 @@
+[package]
+name = "mpx-redact"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+regex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

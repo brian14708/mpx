@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mpx-core", "crates/mpx-protocol"]
+members = ["crates/mpx-core", "crates/mpx-protocol", "crates/mpx-redact"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,15 +12,19 @@ async-stream = "0.3.6"
 base64 = "0.23"
 bon = "3"
 bytes = "1"
+criterion = { version = "0.8", default-features = false }
 eventsource-stream = "0.2.3"
 futures-util = { version = "0.3", default-features = false }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 mpx-protocol = { path = "crates/mpx-protocol" }
+mpx-redact = { path = "crates/mpx-redact" }
 percent-encoding = "2"
+regex = "1"
 serde = "1"
 serde_json = "1"
+sha2 = "0.10"
 sync_wrapper = { version = "1", features = ["futures"] }
 thiserror = "2"
 tokio = "1"

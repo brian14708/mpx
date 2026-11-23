@@ -81,6 +81,11 @@ pub struct Response {
 }
 
 impl Response {
+    /// Visits every content block, including nested tool-result content.
+    pub fn visit_blocks_mut(&mut self, visitor: &mut impl FnMut(&mut ContentBlock)) {
+        crate::request::visit_slice(&mut self.content, visitor);
+    }
+
     /// Converts the response to an assistant message without losing blocks.
     #[must_use]
     pub fn to_message(&self) -> Message {
