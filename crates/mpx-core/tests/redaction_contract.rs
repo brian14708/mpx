@@ -8,16 +8,24 @@ use http::{Method, Request, Response, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Full};
 use mpx_core::{
     Ingress, IngressLayer, Redaction, RedactionLayer, Upstream, UpstreamService,
-    mpx_protocol::{self, Body, ClientContext, Codec, Diagnostics, Endpoint, Protocol},
-    mpx_redact::{
-        Digits, GeneratorBinding, Hex, Mask, Matcher, Number, PlaceholderTemplate,
-        RedactionSession, ReplacementMap, Rule, Rules, WordList,
-    },
+    mpx_protocol::{self, Body, ClientContext, Codec, Endpoint, Protocol},
+    mpx_redact::{Matcher, RedactionSession, Replacement, ReplacementMap, Rules, Slot},
 };
 use serde_json::{Value, json};
 use tower::{ServiceBuilder, ServiceExt, service_fn};
 
 const SECRET: &str = "Nightjar Project";
+
+fn replacement() -> Replacement {
+    Replacement::kind("SECRET").unwrap()
+}
+
+fn email_matcher() -> Matcher {
+    Matcher::regex(
+        r"[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
+    )
+    .unwrap()
+}
 
 /// Builds ingress → redaction → upstream with the default codec.
 fn gateway<T>(
@@ -40,15 +48,10 @@ fn gateway<T>(
 #[tokio::test]
 async fn session_id_scopes_redaction_markers_and_aliases() {
     let rules = Rules::new([
-        Rule::new(Matcher::Literal(SECRET.into()), Mask::tag()),
-        Rule::new(
-            Matcher::Email,
-            Mask::alias(
-                "email",
-                "{{hex}}@example.com",
-                &[GeneratorBinding::new("hex", Hex(16))],
-            )
-            .unwrap(),
+        (Matcher::literal(SECRET), replacement()),
+        (
+            email_matcher(),
+            Replacement::template("{}@example.com", &[Slot::base16(16)]).unwrap(),
         ),
     ]);
     let transport = service_fn(|request: Request<Body>| async move {
@@ -100,7 +103,7 @@ async fn session_id_scopes_redaction_markers_and_aliases() {
         .with_scope("session-a")
         .mask(
             SECRET,
-            &Rules::new([Rule::new(Matcher::Literal(SECRET.into()), Mask::tag())]),
+            &Rules::new([(Matcher::literal(SECRET), replacement())]),
         )
         .unwrap();
     assert_eq!(marker, expected_marker);
@@ -126,7 +129,7 @@ async fn redacts_structured_tool_fields_and_restores_streamed_arguments() {
             assert!(
                 arguments_value["email"]
                     .as_str()
-                    .is_some_and(|value| value.starts_with("<|mpx-redact-"))
+                    .is_some_and(|value| value.starts_with("{{SECRET_"))
             );
 
             if upstream_streams {
@@ -192,7 +195,7 @@ async fn redacts_structured_tool_fields_and_restores_streamed_arguments() {
                 )
             }
         });
-        let rules = Rules::new([Rule::new(Matcher::Email, Mask::tag())]);
+        let rules = Rules::new([(email_matcher(), replacement())]);
         let gateway = gateway(
             transport,
             RedactionLayer::new(rules).with_hmac_key(b"gateway-test-secret"),
@@ -254,10 +257,12 @@ async fn zero_hit_redaction_preserves_gemini_request_replay() {
                 .unwrap(),
         )
     });
-    let rules = Rules::new([Rule::new(Matcher::Email, Mask::tag())]);
+    let rules = Rules::new([(email_matcher(), replacement())]);
     let gateway = gateway(
         transport,
-        RedactionLayer::new(rules).with_hmac_key(b"gateway-test-secret"),
+        RedactionLayer::new(rules)
+            .with_hmac_key(b"gateway-test-secret")
+            .with_replacement_map(),
         Protocol::GenerateContent,
     );
     let request = Request::post("/v1beta/models/gemini-2:generateContent")
@@ -268,6 +273,8 @@ async fn zero_hit_redaction_preserves_gemini_request_replay() {
         .unwrap();
     let response = gateway.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let replacements = response.extensions().get::<ReplacementMap>().unwrap();
+    assert_eq!(replacements.entries().len(), 0);
 }
 
 #[tokio::test]
@@ -288,13 +295,12 @@ async fn masking_structured_tool_result_keeps_json_siblings() {
                 .unwrap(),
         )
     });
-    let rules = Rules::new([Rule::new(
-        Matcher::Literal("secret".into()),
-        Mask::literal("\""),
-    )]);
+    let rules = Rules::new([(Matcher::literal("secret"), Replacement::mask("\""))]);
     let gateway = gateway(
         transport,
-        RedactionLayer::new(rules).with_hmac_key(b"gateway-test-secret"),
+        RedactionLayer::new(rules)
+            .with_hmac_key(b"gateway-test-secret")
+            .with_replacement_map(),
         Protocol::GenerateContent,
     );
     let request = Request::post("/v1/chat/completions")
@@ -312,10 +318,16 @@ async fn masking_structured_tool_result_keeps_json_siblings() {
         .unwrap();
     let response = gateway.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let replacements = response.extensions().get::<ReplacementMap>().unwrap();
+    assert_eq!(replacements.entries().len(), 0);
+    assert_eq!(
+        replacements.forward_entries().collect::<Vec<_>>(),
+        [("secret", "\"")]
+    );
 }
 
 #[tokio::test]
-async fn aliases_and_fallback_tags_round_trip_through_sse() {
+async fn alias_collision_falls_back_and_restores_the_stream() {
     let transport = service_fn(|request: Request<Body>| async move {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let request: Value = serde_json::from_slice(&bytes).unwrap();
@@ -323,38 +335,27 @@ async fn aliases_and_fallback_tags_round_trip_through_sse() {
         let (named, tail) = text.split_once(", ").unwrap();
         let (fallback, project) = tail.split_once(", ").unwrap();
         assert_eq!(named, "cedar-cedar@example.com");
-        assert!(fallback.starts_with("<|mpx-redact-"));
+        assert!(fallback.starts_with("{{FALLBACK_"));
         let digits = project.strip_prefix("project-cedar-").unwrap();
         assert_eq!(digits.len(), 4);
         assert!(digits.bytes().all(|byte| byte.is_ascii_digit()));
         Ok::<_, mpx_protocol::BoxError>(echo(text, true))
     });
-    let words = WordList::new(&["cedar"]).unwrap();
-    let email = Rule::new(
-        Matcher::Email,
-        Mask::alias(
-            "email",
-            "{{word}}-{{word}}@example.com",
-            &[GeneratorBinding::new("word", words.clone())],
-        )
-        .unwrap(),
+    let words = Slot::wordlist(["cedar"]).unwrap();
+    let email = (
+        email_matcher(),
+        Replacement::template("{}-{}@example.com", &[words.clone(), words.clone()]).unwrap(),
     );
-    let project = Rule::new(
+    let project = (
         Matcher::regex(r"Project [A-Z][a-z]+").unwrap(),
-        Mask::alias(
-            "project",
-            "project-{{word}}-{{digits}}",
-            &[
-                GeneratorBinding::new("word", words),
-                GeneratorBinding::new("digits", Digits(4)),
-            ],
-        )
-        .unwrap(),
+        Replacement::template("project-{}-{}", &[words, Slot::digits(4)]).unwrap(),
     );
     let rules = Rules::new([email, project]);
     let gateway = gateway(
         transport,
-        RedactionLayer::new(rules).with_replacement_map(),
+        RedactionLayer::new(rules)
+            .with_fallback(Replacement::kind("FALLBACK").unwrap())
+            .with_replacement_map(),
         Protocol::ChatCompletions,
     );
     let request = Request::post("/v1/chat/completions")
@@ -364,13 +365,12 @@ async fn aliases_and_fallback_tags_round_trip_through_sse() {
     let response = gateway.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let replacements = response.extensions().get::<ReplacementMap>().unwrap();
-    assert_eq!(replacements.entries().len(), 3);
     assert_eq!(
         replacements.get("cedar-cedar@example.com"),
         Some("alice@corp.test")
     );
     assert!(replacements.entries().any(|(replacement, original)| {
-        replacement.starts_with("<|mpx-redact-") && original == "bob@corp.test"
+        replacement.starts_with("{{FALLBACK_") && original == "bob@corp.test"
     }));
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
@@ -381,11 +381,6 @@ async fn aliases_and_fallback_tags_round_trip_through_sse() {
 
 #[tokio::test]
 async fn restores_complete_and_streamed_responses() {
-    let custom = PlaceholderTemplate::new(
-        r#"<redacted value="{{hex}}"/>"#,
-        &[GeneratorBinding::new("hex", Hex(12))],
-    )
-    .unwrap();
     for (upstream_streams, client_streams, custom_template) in [
         (false, false, false),
         (true, true, false),
@@ -395,28 +390,38 @@ async fn restores_complete_and_streamed_responses() {
         let (prefix, suffix, width) = if custom_template {
             (r#"<redacted value=""#, r#""/>"#, 12)
         } else {
-            ("<|mpx-redact-", "|>", 6)
+            ("{{SECRET_", "}}", 8)
         };
         let transport = service_fn(move |request: Request<Body>| async move {
             let bytes = request.into_body().collect().await.unwrap().to_bytes();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
-            let placeholder = body["messages"][1]["content"].as_str().unwrap();
-            let generated = placeholder
+            let replacement = body["messages"][1]["content"].as_str().unwrap();
+            let generated = replacement
                 .strip_prefix(prefix)
                 .unwrap()
                 .strip_suffix(suffix)
                 .unwrap();
             assert_eq!(generated.len(), width);
-            assert!(generated.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            assert_eq!(body["messages"][0]["content"], placeholder);
+            if custom_template {
+                assert!(generated.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            } else {
+                assert!(
+                    generated
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+                );
+            }
+            assert_eq!(body["messages"][0]["content"], replacement);
             assert!(!std::str::from_utf8(&bytes).unwrap().contains(SECRET));
-            Ok::<_, mpx_protocol::BoxError>(echo(placeholder, upstream_streams))
+            Ok::<_, mpx_protocol::BoxError>(echo(replacement, upstream_streams))
         });
-        let rules = Rules::new([Rule::new(Matcher::Literal(SECRET.into()), Mask::tag())]);
-        let mut layer = RedactionLayer::new(rules);
-        if custom_template {
-            layer = layer.with_placeholder_template(custom.clone());
-        }
+        let mask = if custom_template {
+            Replacement::template(r#"<redacted value="{}"/>"#, &[Slot::base16(12)]).unwrap()
+        } else {
+            replacement()
+        };
+        let layer = RedactionLayer::new(Rules::new([(Matcher::literal(SECRET), mask)]))
+            .with_replacement_map();
         let gateway = gateway(transport, layer, Protocol::ChatCompletions);
         let request = Request::post("/v1/chat/completions")
             .header(header::CONTENT_TYPE, "application/json")
@@ -428,7 +433,9 @@ async fn restores_complete_and_streamed_responses() {
             .unwrap();
         let response = gateway.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.extensions().get::<ReplacementMap>().is_none());
+        let replacements = response.extensions().get::<ReplacementMap>().unwrap();
+        assert_eq!(replacements.entries().len(), 1);
+        assert_eq!(replacements.entries().next().unwrap().1, SECRET);
         let is_sse = response.headers()[header::CONTENT_TYPE] == "text/event-stream";
         assert_eq!(is_sse, client_streams);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -452,7 +459,7 @@ async fn restores_complete_and_streamed_responses() {
 async fn restores_across_protocols_and_preserves_original_marker_text() {
     const MESSAGES_STREAM: &str =
         include_str!("../../mpx-protocol/tests/contracts/fixtures/messages.sse");
-    let rules = Rules::new([Rule::new(Matcher::Literal(SECRET.into()), Mask::tag())]);
+    let rules = Rules::new([(Matcher::literal(SECRET), replacement())]);
     let literal = RedactionSession::new().mask(SECRET, &rules).unwrap();
     for (upstream_streams, client_streams) in [(false, false), (true, true), (true, false)] {
         let expected_literal = literal.clone();
@@ -464,7 +471,7 @@ async fn restores_across_protocols_and_preserves_original_marker_text() {
                 assert!(!std::str::from_utf8(&bytes).unwrap().contains(SECRET));
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
                 let marker = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-                assert!(marker.starts_with("<|mpx-redact-"));
+                assert!(marker.starts_with("{{SECRET_"));
                 assert_ne!(marker, expected_literal);
                 assert_eq!(body["messages"][1]["content"][0]["text"], expected_literal);
                 let (content_type, payload) = if upstream_streams {
@@ -528,19 +535,51 @@ async fn restores_across_protocols_and_preserves_original_marker_text() {
 }
 
 #[tokio::test]
-async fn generator_exhaustion_fails_before_dispatch() {
+async fn block_rule_returns_forbidden_before_dispatch() {
     async fn unexpected_dispatch(
         _: Request<Body>,
     ) -> Result<Response<Full<Bytes>>, mpx_protocol::BoxError> {
-        panic!("generator exhaustion must reject the request before dispatch");
+        panic!("blocked requests must never dispatch");
     }
 
-    let rules = Rules::new([Rule::new(Matcher::Email, Mask::tag())]);
-    let template =
-        PlaceholderTemplate::new("<{{n}}>", &[GeneratorBinding::new("n", Number(0..=0))]).unwrap();
+    let rules = Rules::new([(email_matcher(), Replacement::block())]);
     let gateway = gateway(
         service_fn(unexpected_dispatch),
-        RedactionLayer::new(rules).with_placeholder_template(template),
+        RedactionLayer::new(rules),
+        Protocol::ChatCompletions,
+    );
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(
+            br#"{"model":"gpt-5","messages":[{"role":"user","content":"a@example.org"}]}"#,
+        )))
+        .unwrap();
+    let response = gateway.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["code"], "redaction_blocked");
+    assert_eq!(
+        error["error"]["message"],
+        "request blocked by a redaction rule"
+    );
+}
+
+#[tokio::test]
+async fn a_collision_is_rejected_before_dispatch_by_default() {
+    async fn unexpected_dispatch(
+        _: Request<Body>,
+    ) -> Result<Response<Full<Bytes>>, mpx_protocol::BoxError> {
+        panic!("strict mode must reject a collision before dispatch");
+    }
+
+    let rules = Rules::new([(
+        email_matcher(),
+        Replacement::template("<{}>", &[Slot::number(0..=0)]).unwrap(),
+    )]);
+    let gateway = gateway(
+        service_fn(unexpected_dispatch),
+        RedactionLayer::new(rules),
         Protocol::ChatCompletions,
     );
     let request = Request::post("/v1/chat/completions")
@@ -550,41 +589,31 @@ async fn generator_exhaustion_fails_before_dispatch() {
         )))
         .unwrap();
     let response = gateway.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let error: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         error["error"]["message"],
-        "could not generate an unused redaction marker from template \"<{{n}}>\" after 1 of 1 candidate(s)"
+        "could not use the redaction replacement from template \"<{}>\""
     );
+    assert_eq!(error["error"]["code"], "redaction_replacement_unavailable");
 }
 
 #[tokio::test]
-async fn probing_is_recorded_as_a_cache_stability_warning() {
-    let rules = Rules::new([Rule::new(Matcher::Email, Mask::tag())]);
-    let template =
-        PlaceholderTemplate::new("<{{n}}>", &[GeneratorBinding::new("n", Number(0..=1))]).unwrap();
-    let candidate = RedactionSession::new()
-        .with_placeholder_template(template.clone())
-        .mask("a@example.org", &rules)
-        .unwrap();
-    let expected_prefix = candidate.clone();
-    let transport = service_fn(move |request: Request<Body>| {
-        let expected_prefix = expected_prefix.clone();
-        async move {
-            let bytes = request.into_body().collect().await.unwrap().to_bytes();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            let text = body["messages"][0]["content"].as_str().unwrap();
-            assert!(text.starts_with(&format!("{expected_prefix} ")));
-            assert_ne!(text, format!("{expected_prefix} {expected_prefix}"));
-            Ok::<_, mpx_protocol::BoxError>(echo("ok", false))
-        }
+async fn a_candidate_present_in_another_field_uses_the_configured_literal_fallback() {
+    let mask = Replacement::template("<{}>", &[Slot::number(0..=0)]).unwrap();
+    let rules = Rules::new([(email_matcher(), mask)]);
+    let transport = service_fn(|request: Request<Body>| async move {
+        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let mask = body["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(mask, "[removed]");
+        assert_eq!(body["messages"][1]["content"], r#"{"value":"<0>"}"#);
+        Ok::<_, mpx_protocol::BoxError>(echo(&format!("{mask} <0>"), false))
     });
     let gateway = gateway(
         transport,
-        RedactionLayer::new(rules)
-            .with_placeholder_template(template)
-            .with_replacement_map(),
+        RedactionLayer::new(rules).with_fallback(Replacement::mask("[removed]")),
         Protocol::ChatCompletions,
     );
     let request = Request::post("/v1/chat/completions")
@@ -592,21 +621,84 @@ async fn probing_is_recorded_as_a_cache_stability_warning() {
         .body(Full::new(Bytes::from(
             json!({
                 "model": "gpt-5",
-                "messages": [{"role": "user", "content": format!("{candidate} a@example.org")}]
+                "messages": [
+                    {"role": "user", "content": "a@example.org"},
+                    {"role": "assistant", "content": r#"{"value":"<0>"}"#}
+                ]
             })
             .to_string(),
         )))
         .unwrap();
     let response = gateway.oneshot(request).await.unwrap();
-    let diagnostics = response
-        .extensions()
-        .get::<Diagnostics>()
-        .unwrap()
-        .entries();
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.path == "redaction.replacement"
-            && diagnostic.message.contains("collision probing")
-    }));
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "echo [removed] <0>"
+    );
+}
+
+#[tokio::test]
+async fn rejects_an_alias_and_fallback_reserved_in_a_later_tool_result() {
+    async fn unexpected_dispatch(
+        _: Request<Body>,
+    ) -> Result<Response<Full<Bytes>>, mpx_protocol::BoxError> {
+        panic!("a request with no available replacement must fail before dispatch");
+    }
+
+    let key = b"gateway-test-secret";
+    let private = "private";
+    let fallback = Replacement::kind("FALLBACK").unwrap();
+    let marker = RedactionSession::new()
+        .with_hmac_key(key)
+        .mask(
+            private,
+            &Rules::new([(Matcher::literal(private), fallback.clone())]),
+        )
+        .unwrap();
+    let escaped_fallback = marker.replacen('{', r"\u007b", 1);
+    let history = format!(r#"{{"alias":"cedar","marker":"{escaped_fallback}"}}"#);
+    let body = Bytes::from(
+        json!({
+            "model": "gpt-5",
+            "messages": [
+                {"role": "user", "content": private},
+                {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": history}
+            ]
+        })
+        .to_string(),
+    );
+
+    for (allow_fallback, rejected_template) in [(false, "{}"), (true, "{{FALLBACK_{}}}")] {
+        let rules = Rules::new([(
+            Matcher::literal(private),
+            Replacement::template("{}", &[Slot::literal("cedar")]).unwrap(),
+        )]);
+        let mut layer = RedactionLayer::new(rules).with_hmac_key(key);
+        if allow_fallback {
+            layer = layer.with_fallback(fallback.clone());
+        }
+        let gateway = gateway(
+            service_fn(unexpected_dispatch),
+            layer,
+            Protocol::ChatCompletions,
+        );
+        let request = Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(body.clone()))
+            .unwrap();
+        let response = gateway.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "redaction_replacement_unavailable");
+        assert_eq!(
+            error["error"]["message"],
+            format!("could not use the redaction replacement from template {rejected_template:?}")
+        );
+    }
 }
 
 fn streamed_text(body: &str) -> String {
@@ -637,7 +729,7 @@ async fn stream_fixture_replays_snapshot_without_redaction_layer() {
     let codec = Codec::default();
     let protocol = Protocol::ChatCompletions;
     let response = codec
-        .decode_response(echo("some placeholder", true), protocol)
+        .decode_response(echo("some replacement", true), protocol)
         .await
         .unwrap();
     let client = ClientContext::new(protocol);
@@ -647,11 +739,11 @@ async fn stream_fixture_replays_snapshot_without_redaction_layer() {
     assert_eq!(value["id"], "snapshot");
 }
 
-fn echo(placeholder: &str, stream: bool) -> Response<Full<Bytes>> {
+fn echo(replacement: &str, stream: bool) -> Response<Full<Bytes>> {
     let id = if stream { "snapshot" } else { "echo" };
     let complete = json!({
         "id": id, "object": "chat.completion", "created": 0, "model": "gpt-5",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("echo {placeholder}")}, "finish_reason": "stop"}]
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("echo {replacement}")}, "finish_reason": "stop"}]
     }).to_string();
     if !stream {
         return Response::builder()
@@ -663,7 +755,7 @@ fn echo(placeholder: &str, stream: bool) -> Response<Full<Bytes>> {
     let snapshot = STANDARD_NO_PAD.encode(complete);
     let protocol = Protocol::ChatCompletions;
     let mut sse = format!(": mpx-buffered-response-v1 {protocol} {snapshot}\n");
-    let (first, rest) = placeholder.split_at(10);
+    let (first, rest) = replacement.split_at(10);
     for (delta, reason) in [
         (
             json!({"role": "assistant", "content": format!("echo {first}")}),

@@ -155,6 +155,15 @@ where
 }
 
 fn api_error(error: &BoxError) -> ApiError {
+    if let Some(error) = error.downcast_ref::<mpx_redact::Error>()
+        && let Some((kind, code)) = redaction_error(error)
+    {
+        return ApiError::builder()
+            .kind(kind)
+            .message(error.to_string())
+            .code(code)
+            .build();
+    }
     if let Some(error) = error.downcast_ref::<ProtocolError>() {
         return error.to_api_error();
     }
@@ -181,6 +190,24 @@ fn api_error(error: &BoxError) -> ApiError {
             .build();
     }
     ApiError::new(ApiErrorKind::Internal, error.to_string())
+}
+
+/// Classifies redaction failures raised while masking a request.
+const fn redaction_error(error: &mpx_redact::Error) -> Option<(ApiErrorKind, &'static str)> {
+    match error {
+        mpx_redact::Error::Blocked => Some((ApiErrorKind::Permission, "redaction_blocked")),
+        mpx_redact::Error::ReplacementUnavailable { .. } => Some((
+            ApiErrorKind::InvalidRequest,
+            "redaction_replacement_unavailable",
+        )),
+        mpx_redact::Error::OverlappingReplacements => {
+            Some((ApiErrorKind::Internal, "redaction_overlapping_rules"))
+        }
+        mpx_redact::Error::DetectorFailed { .. } => {
+            Some((ApiErrorKind::Internal, "redaction_detector_failed"))
+        }
+        _ => None,
+    }
 }
 
 fn is_timeout(error: &(dyn StdError + 'static)) -> bool {

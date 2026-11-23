@@ -9,10 +9,10 @@ use std::{
 
 use futures_util::StreamExt;
 use mpx_protocol::{
-    BlockDelta, BoxError, Codec, ContentBlock, Diagnostic, DiagnosticKind, Diagnostics, Endpoint,
-    Error, EventStream, Extra, Request, ResponseBody, StreamEvent, Tool, ToolArguments,
+    BlockDelta, BoxError, Codec, ContentBlock, Endpoint, Error, EventStream, Extra, Request,
+    ResponseBody, StreamEvent, Tool, ToolArguments,
 };
-use mpx_redact::{PlaceholderTemplate, RedactionSession, Restorer, Rules};
+use mpx_redact::{RedactionSession, Replacement, Restorer, Rules};
 use serde_json::Value;
 use tower_layer::Layer;
 use tower_service::Service;
@@ -27,14 +27,20 @@ const DEFAULT_HMAC_KEY: &str = "mpx-redact-static-key-v1";
 /// structured tool arguments and declarations, metadata, and nested tool results. Generated aliases and markers
 /// use a versioned HMAC-SHA-256 derivation with the request session ID as scope. Raw passthrough
 /// routes are rejected. The client must be trusted to receive the restored values,
-/// since the upstream can echo any placeholder it received.
+/// since the upstream can echo any replacement it received.
+///
+/// Call [`RedactionLayer::with_replacement_map`] to attach the issued
+/// [`mpx_redact::ReplacementMap`] to each response's Rust extensions.
 ///
 /// ```
-/// use mpx_core::{IngressLayer, RedactionLayer, mpx_protocol::Codec, mpx_redact::{Mask, Matcher, Rule, Rules}};
+/// use mpx_core::{IngressLayer, RedactionLayer, mpx_protocol::Codec, mpx_redact::{Matcher, Replacement, Rules}};
 /// use tower::ServiceBuilder;
 ///
 /// let codec = Codec::default();
-/// let rule = Rule::new(Matcher::regex(r"\bID-[0-9]+\b")?, Mask::tag());
+/// let rule = (
+///     Matcher::regex(r"\bID-[0-9]+\b")?,
+///     Replacement::kind("SECRET")?,
+/// );
 /// let rules = Rules::new([rule]);
 /// let layers = ServiceBuilder::new()
 ///     .layer(IngressLayer::new(codec))
@@ -46,37 +52,34 @@ const DEFAULT_HMAC_KEY: &str = "mpx-redact-static-key-v1";
 #[derive(Clone)]
 pub struct RedactionLayer {
     rules: Arc<Rules>,
-    template: PlaceholderTemplate,
     hmac_key: Arc<[u8]>,
-    strict: bool,
-    record_replacements: bool,
+    fallback: Option<Replacement>,
+    attach_replacement_map: bool,
 }
 
 impl fmt::Debug for RedactionLayer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RedactionLayer")
             .field("rules", &self.rules)
-            .field("template", &self.template)
-            .field("strict", &self.strict)
-            .field("record_replacements", &self.record_replacements)
+            .field("fallback", &self.fallback)
+            .field("attach_replacement_map", &self.attach_replacement_map)
             .finish_non_exhaustive()
     }
 }
 
 impl RedactionLayer {
-    /// Creates a redaction layer using the supplied rules.
+    /// Creates a redaction layer that rejects replacement collisions before dispatch.
     #[must_use]
     pub fn new(rules: Rules) -> Self {
         Self {
             rules: Arc::new(rules),
-            template: PlaceholderTemplate::default(),
             hmac_key: Arc::from(DEFAULT_HMAC_KEY.as_bytes()),
-            strict: false,
-            record_replacements: false,
+            fallback: None,
+            attach_replacement_map: false,
         }
     }
 
-    /// Uses the supplied gateway secret for generated aliases and markers.
+    /// Uses the supplied gateway secret for generated template replacements.
     ///
     /// The default is a fixed built-in key. Supply a deployment secret when
     /// replacements must use a private key or remain stable across deployments.
@@ -86,27 +89,32 @@ impl RedactionLayer {
         self
     }
 
-    /// Uses the given template for upstream masking and response restoration.
+    /// Rejects collisions with configured replacements. This is the default.
     #[must_use]
-    pub fn with_placeholder_template(mut self, template: PlaceholderTemplate) -> Self {
-        self.template = template;
+    pub fn with_strict(mut self) -> Self {
+        self.fallback = None;
         self
     }
 
-    /// Disables collision probing so replacements stay independent of the
-    /// other values in the request and remain stable for provider caches.
-    #[must_use]
-    pub const fn with_strict(mut self) -> Self {
-        self.strict = true;
-        self
-    }
-
-    /// Attaches a [`mpx_redact::ReplacementMap`] to the response's Rust extensions.
+    /// Tries the supplied fallback when a replacement collides or an alias would
+    /// join adjacent text. Fallbacks for permanent rules remain permanent.
     ///
-    /// The map pairs the reversible tags and aliases with their original values.
+    /// Choose a fallback that you expect to avoid collisions. An unavailable
+    /// fallback rejects the request before dispatch.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: Replacement) -> Self {
+        self.fallback = Some(fallback);
+        self
+    }
+
+    /// Attaches the issued [`mpx_redact::ReplacementMap`] to each response's extensions.
+    ///
+    /// The map holds the original values, including the originals of permanent
+    /// masks in its forward entries. Only enable this when every later layer
+    /// may see the unmasked values.
     #[must_use]
     pub const fn with_replacement_map(mut self) -> Self {
-        self.record_replacements = true;
+        self.attach_replacement_map = true;
         self
     }
 }
@@ -152,12 +160,12 @@ where
             }
         };
         let future = self.inner.call(request);
-        let expose_replacements = self.layer.record_replacements;
+        let attach_replacement_map = self.layer.attach_replacement_map;
         Box::pin(async move {
             restore_response(
                 future.await.map_err(Into::into)?,
                 session,
-                expose_replacements,
+                attach_replacement_map,
             )
         })
     }
@@ -176,46 +184,26 @@ fn mask_request(
         }
         .into());
     }
-    let mut session = RedactionSession::new()
-        .with_placeholder_template(layer.template.clone())
-        .with_hmac_key(layer.hmac_key.as_ref());
+    let mut session = RedactionSession::new().with_hmac_key(layer.hmac_key.as_ref());
     if let Some(session_id) = request.body().session_id.as_deref()
         && !session_id.trim().is_empty()
     {
         session = session.with_scope(session_id);
     }
-    if layer.strict {
-        session = session.with_strict();
+    if let Some(fallback) = &layer.fallback {
+        session = session.with_fallback(fallback.clone());
     }
     // Reserve across every field before masking any, so no issued replacement
     // collides with text already present elsewhere in the request.
-    reserve_request(&mut session, request.body(), &layer.rules);
-    let changed = mask_request_body(&mut session, request.body_mut(), &layer.rules)?;
-    if session.probe_count() > 0 {
-        let protocol = request
-            .extensions()
-            .get::<Endpoint>()
-            .map_or(mpx_protocol::Protocol::ChatCompletions, |endpoint| {
-                endpoint.protocol
-            });
-        let diagnostics = request
-            .extensions()
-            .get::<Diagnostics>()
-            .cloned()
-            .unwrap_or_default();
-        diagnostics.push(
-            Diagnostic::builder()
-            .kind(DiagnosticKind::Fallback)
-            .protocol(protocol)
-            .path("redaction.replacement")
-            .message(format!(
-                "{} replacement(s) required collision probing, which can reduce provider prompt-cache stability",
-                session.probe_count()
-            ))
-            .build(),
-        );
-        request.extensions_mut().insert(diagnostics);
-    }
+    let mut visitor = RequestFieldVisitor {
+        session: &mut session,
+        rules: &layer.rules,
+        pass: RequestPass::Reserve,
+    };
+    visitor.request(request.body_mut())?;
+    visitor.pass = RequestPass::Mask;
+    let changed = visitor.request(request.body_mut())?;
+    session.clear_reserved_replacements();
     if changed {
         // Keep native replay when the normalized request was unchanged.
         Codec::disable_request_replay(request);
@@ -223,368 +211,214 @@ fn mask_request(
     Ok(session)
 }
 
-fn reserve_request(session: &mut RedactionSession, request: &Request, rules: &Rules) {
-    reserve_blocks(session, &request.instructions, rules);
-    for message in &request.messages {
-        reserve_blocks(session, &message.content, rules);
-    }
-    for tool in &request.tools {
-        reserve_tool(session, tool, rules);
-    }
-    for value in request.metadata.values() {
-        reserve_json_value(session, value, rules);
-    }
-    if let Some(output_format) = &request.output_format {
-        if let Some(schema) = &output_format.schema {
-            reserve_json_value(session, schema, rules);
-        }
-        reserve_extra(session, output_format.extra.as_ref(), rules);
-    }
-    reserve_extra(session, request.sampling.extra.as_ref(), rules);
-    reserve_extra(
-        session,
-        request
-            .reasoning
-            .as_ref()
-            .and_then(|reasoning| reasoning.extra.as_ref()),
-        rules,
-    );
-    reserve_extra(session, request.extra.as_ref(), rules);
+enum RequestPass {
+    Reserve,
+    Mask,
 }
 
-fn reserve_blocks(session: &mut RedactionSession, blocks: &[ContentBlock], rules: &Rules) {
-    for block in blocks {
-        reserve_block(session, block, rules);
-    }
+struct RequestFieldVisitor<'a> {
+    session: &'a mut RedactionSession,
+    rules: &'a Rules,
+    pass: RequestPass,
 }
 
-fn reserve_block(session: &mut RedactionSession, block: &ContentBlock, rules: &Rules) {
-    match block {
-        ContentBlock::Text { text, .. } | ContentBlock::Refusal { text, .. } => {
-            session.reserve_replacements_in(text, rules);
+impl RequestFieldVisitor<'_> {
+    fn request(&mut self, request: &mut Request) -> Result<bool, BoxError> {
+        let mut changed = self.blocks(&mut request.instructions)?;
+        for message in &mut request.messages {
+            changed |= self.blocks(&mut message.content)?;
         }
-        ContentBlock::Reasoning { text, summary, .. } => {
-            session.reserve_replacements_in(text, rules);
-            for item in summary {
-                session.reserve_replacements_in(item, rules);
+        for tool in &mut request.tools {
+            changed |= self.tool(tool)?;
+        }
+        for value in request.metadata.values_mut() {
+            changed |= self.json_value(value)?;
+        }
+        if let Some(output_format) = &mut request.output_format {
+            if let Some(schema) = &mut output_format.schema {
+                changed |= self.json_value(schema)?;
             }
+            changed |= self.extra(output_format.extra.as_mut())?;
         }
-        ContentBlock::ToolCall { arguments, .. } => {
-            reserve_json_text(session, arguments.as_str(), rules);
+        changed |= self.extra(request.sampling.extra.as_mut())?;
+        if let Some(reasoning) = &mut request.reasoning {
+            changed |= self.extra(reasoning.extra.as_mut())?;
         }
-        ContentBlock::ToolResult { content, .. } => reserve_blocks(session, content, rules),
-        ContentBlock::WebSearchResult { query, results, .. } => {
-            reserve_option(session, query.as_deref(), rules);
-            for result in results {
-                reserve_option(session, result.title.as_deref(), rules);
-                reserve_option(session, result.url.as_deref(), rules);
-                reserve_option(session, result.text.as_deref(), rules);
+        changed |= self.extra(request.extra.as_mut())?;
+        Ok(changed)
+    }
+
+    fn blocks(&mut self, blocks: &mut [ContentBlock]) -> Result<bool, BoxError> {
+        let mut changed = false;
+        for block in blocks {
+            changed |= self.block(block)?;
+        }
+        Ok(changed)
+    }
+
+    fn block(&mut self, block: &mut ContentBlock) -> Result<bool, BoxError> {
+        match block {
+            ContentBlock::Text { text, .. } => {
+                let value = json_container(text);
+                // Also reserve the serialized form of structured text blocks.
+                if value.is_some() && matches!(self.pass, RequestPass::Reserve) {
+                    self.session.reserve_replacements_in(text, self.rules);
+                }
+                if let Some(replacement) = self.encoded_json(text, value)? {
+                    *text = replacement;
+                    return Ok(true);
+                }
+                Ok(false)
             }
-        }
-        ContentBlock::Native { json, .. } => reserve_json_value(session, json, rules),
-        _ => {}
-    }
-}
-
-fn reserve_tool(session: &mut RedactionSession, tool: &Tool, rules: &Rules) {
-    match tool {
-        Tool::Function {
-            description,
-            parameters,
-            extra,
-            ..
-        } => {
-            reserve_option(session, description.as_deref(), rules);
-            reserve_json_value(session, parameters, rules);
-            reserve_extra(session, extra.as_ref(), rules);
-        }
-        Tool::Custom {
-            description,
-            format,
-            extra,
-            ..
-        } => {
-            reserve_option(session, description.as_deref(), rules);
-            if let Some(format) = format {
-                reserve_json_value(session, format, rules);
+            ContentBlock::Refusal { text, .. } => self.string(text),
+            ContentBlock::Reasoning { text, summary, .. } => {
+                let mut changed = self.string(text)?;
+                for item in summary {
+                    changed |= self.string(item)?;
+                }
+                Ok(changed)
             }
-            reserve_extra(session, extra.as_ref(), rules);
-        }
-        Tool::Hosted { json, .. } => reserve_json_value(session, json, rules),
-        _ => {}
-    }
-}
-
-fn reserve_extra(session: &mut RedactionSession, extra: Option<&Extra>, rules: &Rules) {
-    if let Some(extra) = extra {
-        for value in extra.fields.values() {
-            reserve_json_value(session, value, rules);
-        }
-    }
-}
-
-fn reserve_option(session: &mut RedactionSession, value: Option<&str>, rules: &Rules) {
-    if let Some(value) = value {
-        session.reserve_replacements_in(value, rules);
-    }
-}
-
-fn reserve_json_text(session: &mut RedactionSession, text: &str, rules: &Rules) {
-    if let Ok(value) = serde_json::from_str::<Value>(text) {
-        reserve_json_value(session, &value, rules);
-    } else {
-        session.reserve_replacements_in(text, rules);
-    }
-}
-
-fn reserve_json_value(session: &mut RedactionSession, value: &Value, rules: &Rules) {
-    match value {
-        Value::String(text) => session.reserve_replacements_in(text, rules),
-        Value::Array(values) => {
-            for value in values {
-                reserve_json_value(session, value, rules);
+            ContentBlock::ToolCall { arguments, .. } => {
+                if let Some(replacement) =
+                    self.encoded_json(arguments.as_str(), arguments.value().ok())?
+                {
+                    *arguments = replacement.into();
+                    return Ok(true);
+                }
+                Ok(false)
             }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                reserve_json_value(session, value, rules);
+            ContentBlock::ToolResult { content, .. } => self.blocks(content),
+            ContentBlock::WebSearchResult { query, results, .. } => {
+                let mut changed = self.optional_string(query)?;
+                for result in results {
+                    changed |= self.optional_string(&mut result.title)?;
+                    changed |= self.optional_string(&mut result.url)?;
+                    changed |= self.optional_string(&mut result.text)?;
+                }
+                Ok(changed)
             }
+            ContentBlock::Native { json, .. } => self.json_value(json),
+            _ => Ok(false),
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
-}
 
-fn mask_request_body(
-    session: &mut RedactionSession,
-    request: &mut Request,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    let mut changed = false;
-    for block in &mut request.instructions {
-        changed |= mask_block(session, block, rules)?;
-    }
-    for message in &mut request.messages {
-        for block in &mut message.content {
-            changed |= mask_block(session, block, rules)?;
-        }
-    }
-    for tool in &mut request.tools {
-        changed |= mask_tool(session, tool, rules)?;
-    }
-    for value in request.metadata.values_mut() {
-        changed |= mask_json_value(session, value, rules)?;
-    }
-    if let Some(output_format) = &mut request.output_format {
-        if let Some(schema) = &mut output_format.schema {
-            changed |= mask_json_value(session, schema, rules)?;
-        }
-        changed |= mask_extra(session, output_format.extra.as_mut(), rules)?;
-    }
-    changed |= mask_extra(session, request.sampling.extra.as_mut(), rules)?;
-    if let Some(reasoning) = &mut request.reasoning {
-        changed |= mask_extra(session, reasoning.extra.as_mut(), rules)?;
-    }
-    changed |= mask_extra(session, request.extra.as_mut(), rules)?;
-    Ok(changed)
-}
-
-fn mask_block(
-    session: &mut RedactionSession,
-    block: &mut ContentBlock,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    match block {
-        ContentBlock::Text { text, .. } => mask_text_value(session, text, rules),
-        ContentBlock::Refusal { text, .. } => mask_string(session, text, rules),
-        ContentBlock::Reasoning { text, summary, .. } => {
-            let mut changed = mask_string(session, text, rules)?;
-            for item in summary {
-                changed |= mask_string(session, item, rules)?;
+    fn tool(&mut self, tool: &mut Tool) -> Result<bool, BoxError> {
+        match tool {
+            Tool::Function {
+                description,
+                parameters,
+                extra,
+                ..
+            } => {
+                let mut changed = self.optional_string(description)?;
+                changed |= self.json_value(parameters)?;
+                changed |= self.extra(extra.as_mut())?;
+                Ok(changed)
             }
-            Ok(changed)
-        }
-        ContentBlock::ToolCall { arguments, .. } => {
-            let (masked, changed) = mask_json_text(session, arguments.as_str(), rules)?;
-            if changed {
-                *arguments = masked.into();
+            Tool::Custom {
+                description,
+                format,
+                extra,
+                ..
+            } => {
+                let mut changed = self.optional_string(description)?;
+                if let Some(format) = format {
+                    changed |= self.json_value(format)?;
+                }
+                changed |= self.extra(extra.as_mut())?;
+                Ok(changed)
             }
-            Ok(changed)
+            Tool::Hosted { json, .. } => self.json_value(json),
+            _ => Ok(false),
         }
-        ContentBlock::ToolResult { content, .. } => {
-            let mut changed = false;
-            for block in content {
-                changed |= mask_block(session, block, rules)?;
-            }
-            Ok(changed)
-        }
-        ContentBlock::WebSearchResult { query, results, .. } => {
-            let mut changed = mask_option(session, query, rules)?;
-            for result in results {
-                changed |= mask_option(session, &mut result.title, rules)?;
-                changed |= mask_option(session, &mut result.url, rules)?;
-                changed |= mask_option(session, &mut result.text, rules)?;
-            }
-            Ok(changed)
-        }
-        ContentBlock::Native { json, .. } => mask_json_value(session, json, rules),
-        ContentBlock::Image { .. } | ContentBlock::File { .. } | ContentBlock::Audio { .. } => {
-            Ok(false)
-        }
-        _ => Ok(false),
     }
-}
 
-fn mask_tool(
-    session: &mut RedactionSession,
-    tool: &mut Tool,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    match tool {
-        Tool::Function {
-            description,
-            parameters,
-            extra,
-            ..
-        } => {
-            let mut changed = mask_option(session, description, rules)?;
-            changed |= mask_json_value(session, parameters, rules)?;
-            changed |= mask_extra(session, extra.as_mut(), rules)?;
-            Ok(changed)
-        }
-        Tool::Custom {
-            description,
-            format,
-            extra,
-            ..
-        } => {
-            let mut changed = mask_option(session, description, rules)?;
-            if let Some(format) = format {
-                changed |= mask_json_value(session, format, rules)?;
-            }
-            changed |= mask_extra(session, extra.as_mut(), rules)?;
-            Ok(changed)
-        }
-        Tool::Hosted { json, .. } => mask_json_value(session, json, rules),
-        _ => Ok(false),
-    }
-}
-
-fn mask_extra(
-    session: &mut RedactionSession,
-    extra: Option<&mut Extra>,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    let Some(extra) = extra else {
-        return Ok(false);
-    };
-    let mut changed = false;
-    for value in extra.fields.values_mut() {
-        changed |= mask_json_value(session, value, rules)?;
-    }
-    Ok(changed)
-}
-
-fn mask_option(
-    session: &mut RedactionSession,
-    value: &mut Option<String>,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    value
-        .as_mut()
-        .map_or(Ok(false), |value| mask_string(session, value, rules))
-}
-
-fn mask_string(
-    session: &mut RedactionSession,
-    text: &mut String,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    let masked = session
-        .mask_reserved(text, rules)
-        .map_err(|error| -> BoxError { Box::new(error) })?;
-    if masked == *text {
-        return Ok(false);
-    }
-    text.clone_from(&masked);
-    Ok(true)
-}
-
-fn mask_text_value(
-    session: &mut RedactionSession,
-    text: &mut String,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    if let Ok(mut value) = serde_json::from_str::<Value>(text)
-        && matches!(value, Value::Object(_) | Value::Array(_))
-    {
-        let changed = mask_json_value(session, &mut value, rules)?;
-        if !changed {
+    fn extra(&mut self, extra: Option<&mut Extra>) -> Result<bool, BoxError> {
+        let Some(extra) = extra else {
             return Ok(false);
+        };
+        let mut changed = false;
+        for value in extra.fields.values_mut() {
+            changed |= self.json_value(value)?;
         }
-        let masked = serde_json::to_string(&value).map_err(|error| -> BoxError {
-            Box::new(Error::Internal {
-                message: error.to_string(),
-            })
+        Ok(changed)
+    }
+
+    fn optional_string(&mut self, text: &mut Option<String>) -> Result<bool, BoxError> {
+        text.as_mut().map_or(Ok(false), |text| self.string(text))
+    }
+
+    fn string(&mut self, text: &mut String) -> Result<bool, BoxError> {
+        if let Some(replacement) = self.replacement(text)? {
+            *text = replacement;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn replacement(&mut self, text: &str) -> Result<Option<String>, BoxError> {
+        match self.pass {
+            RequestPass::Reserve => {
+                self.session.reserve_replacements_in(text, self.rules);
+                Ok(None)
+            }
+            RequestPass::Mask => {
+                let masked = self.session.mask_reserved(text, self.rules)?;
+                Ok((masked != text).then_some(masked))
+            }
+        }
+    }
+
+    fn encoded_json(
+        &mut self,
+        text: &str,
+        value: Option<Value>,
+    ) -> Result<Option<String>, BoxError> {
+        let Some(mut value) = value else {
+            return self.replacement(text);
+        };
+        if !self.json_value(&mut value)? {
+            return Ok(None);
+        }
+        let encoded = serde_json::to_string(&value).map_err(|error| Error::Internal {
+            message: error.to_string(),
         })?;
-        text.clone_from(&masked);
-        return Ok(true);
+        Ok(Some(encoded))
     }
-    mask_string(session, text, rules)
+
+    fn json_value(&mut self, value: &mut Value) -> Result<bool, BoxError> {
+        match value {
+            Value::String(text) => self.string(text),
+            Value::Array(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= self.json_value(value)?;
+                }
+                Ok(changed)
+            }
+            Value::Object(values) => {
+                let mut changed = false;
+                for value in values.values_mut() {
+                    changed |= self.json_value(value)?;
+                }
+                Ok(changed)
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => Ok(false),
+        }
+    }
 }
 
-fn mask_json_text(
-    session: &mut RedactionSession,
-    text: &str,
-    rules: &Rules,
-) -> Result<(String, bool), BoxError> {
-    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
-        let masked = session
-            .mask_reserved(text, rules)
-            .map_err(|error| -> BoxError { Box::new(error) })?;
-        return Ok((masked.clone(), masked != text));
-    };
-    let changed = mask_json_value(session, &mut value, rules)?;
-    if !changed {
-        return Ok((text.to_owned(), false));
-    }
-    serde_json::to_string(&value)
-        .map(|masked| (masked, true))
-        .map_err(|error| -> BoxError {
-            Box::new(Error::Internal {
-                message: error.to_string(),
-            })
-        })
-}
-
-fn mask_json_value(
-    session: &mut RedactionSession,
-    value: &mut Value,
-    rules: &Rules,
-) -> Result<bool, BoxError> {
-    match value {
-        Value::String(text) => mask_string(session, text, rules),
-        Value::Array(values) => {
-            let mut changed = false;
-            for value in values {
-                changed |= mask_json_value(session, value, rules)?;
-            }
-            Ok(changed)
-        }
-        Value::Object(values) => {
-            let mut changed = false;
-            for value in values.values_mut() {
-                changed |= mask_json_value(session, value, rules)?;
-            }
-            Ok(changed)
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(false),
-    }
+/// Parses text that holds a JSON object or array, the only shapes redacted structurally.
+fn json_container(text: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(|value| matches!(value, Value::Object(_) | Value::Array(_)))
 }
 
 fn restore_response(
     response: http::Response<ResponseBody>,
     session: RedactionSession,
-    expose_replacements: bool,
+    attach_replacement_map: bool,
 ) -> Result<http::Response<ResponseBody>, BoxError> {
     if matches!(response.body(), ResponseBody::Passthrough(_)) {
         return Err(Error::Body {
@@ -604,14 +438,14 @@ fn restore_response(
             };
             (ResponseBody::Complete(response), changed)
         }
-        ResponseBody::Stream(events) => (
-            ResponseBody::Stream(restore_stream(session, events)),
-            !nothing_to_restore,
-        ),
+        ResponseBody::Stream(events) if nothing_to_restore => (ResponseBody::Stream(events), false),
+        ResponseBody::Stream(events) => {
+            (ResponseBody::Stream(restore_stream(session, events)), true)
+        }
         body => (body, false),
     };
     let mut response = http::Response::from_parts(parts, body);
-    if expose_replacements {
+    if attach_replacement_map {
         response.extensions_mut().insert(replacements);
     }
     if changed {
@@ -673,14 +507,12 @@ fn restore_string(session: &RedactionSession, text: &mut String) -> bool {
     if restored == *text {
         return false;
     }
-    text.clone_from(&restored);
+    *text = restored;
     true
 }
 
 fn restore_text_value(session: &RedactionSession, text: &mut String) -> Result<bool, BoxError> {
-    if let Ok(mut value) = serde_json::from_str::<Value>(text)
-        && matches!(value, Value::Object(_) | Value::Array(_))
-    {
+    if let Some(mut value) = json_container(text) {
         let changed = restore_json_value(session, &mut value);
         if !changed {
             return Ok(false);
@@ -690,7 +522,7 @@ fn restore_text_value(session: &RedactionSession, text: &mut String) -> Result<b
                 message: error.to_string(),
             })
         })?;
-        text.clone_from(&restored);
+        *text = restored;
         return Ok(true);
     }
     Ok(restore_string(session, text))
@@ -705,7 +537,8 @@ fn restore_option(session: &RedactionSession, value: &mut Option<String>) -> boo
 fn restore_json_text(session: &RedactionSession, text: &str) -> Result<(String, bool), BoxError> {
     let Ok(mut value) = serde_json::from_str::<Value>(text) else {
         let restored = session.restore(text);
-        return Ok((restored.clone(), restored != text));
+        let changed = restored != text;
+        return Ok((restored, changed));
     };
     let changed = restore_json_value(session, &mut value);
     if !changed {
@@ -741,10 +574,29 @@ fn restore_json_value(session: &RedactionSession, value: &mut Value) -> bool {
     }
 }
 
-const fn block_text(block: &mut ContentBlock) -> Option<(TextKind, &mut String)> {
+/// Returns the block text that later deltas of the same kind extend.
+fn block_text<'a>(
+    block: &'a mut ContentBlock,
+    session: &RedactionSession,
+) -> Option<(TextKind, &'a mut String)> {
     match block {
         ContentBlock::Text { text, .. } => Some((TextKind::Text, text)),
         ContentBlock::Refusal { text, .. } => Some((TextKind::Refusal, text)),
+        ContentBlock::Reasoning { text, summary, .. } => {
+            if !text.is_empty() || summary.is_empty() {
+                for item in summary {
+                    restore_string(session, item);
+                }
+                Some((TextKind::Reasoning, text))
+            } else {
+                // Summary deltas extend the last summary item.
+                let (last, earlier) = summary.split_last_mut()?;
+                for item in earlier {
+                    restore_string(session, item);
+                }
+                Some((TextKind::ReasoningSummary, last))
+            }
+        }
         _ => None,
     }
 }
@@ -753,44 +605,32 @@ const fn block_text(block: &mut ContentBlock) -> Option<(TextKind, &mut String)>
 enum TextKind {
     Text,
     Refusal,
+    Reasoning,
+    ReasoningSummary,
 }
 
-struct StreamField {
-    kind: StreamFieldKind,
-    restorer: Option<Restorer>,
-    arguments: String,
+impl TextKind {
+    const fn delta(self, text: String) -> BlockDelta {
+        match self {
+            Self::Text => BlockDelta::Text(text),
+            Self::Refusal => BlockDelta::Refusal(text),
+            Self::Reasoning => BlockDelta::Reasoning(text),
+            Self::ReasoningSummary => BlockDelta::ReasoningSummary(text),
+        }
+    }
+}
+
+enum StreamField {
+    Text(TextKind, Restorer),
+    Arguments(String),
 }
 
 impl StreamField {
-    fn text(kind: TextKind, session: &RedactionSession) -> Self {
-        Self {
-            kind: StreamFieldKind::Text(kind),
-            restorer: Some(session.restorer()),
-            arguments: String::new(),
-        }
-    }
-
-    const fn arguments(arguments: String) -> Self {
-        Self {
-            kind: StreamFieldKind::Arguments,
-            restorer: None,
-            arguments,
-        }
-    }
-
     const fn kind(&self) -> StreamFieldKind {
-        self.kind
-    }
-
-    fn push_text(&mut self, text: &str) -> String {
-        self.restorer
-            .as_mut()
-            .expect("text stream field has a restorer")
-            .push(text)
-    }
-
-    fn push_arguments(&mut self, text: &str) {
-        self.arguments.push_str(text);
+        match self {
+            Self::Text(kind, _) => StreamFieldKind::Text(*kind),
+            Self::Arguments(_) => StreamFieldKind::Arguments,
+        }
     }
 
     fn finish(
@@ -798,29 +638,21 @@ impl StreamField {
         index: u32,
         session: &RedactionSession,
     ) -> Result<Option<StreamEvent>, BoxError> {
-        let delta = match self.kind {
-            StreamFieldKind::Text(kind) => {
-                let text = self
-                    .restorer
-                    .expect("text stream field has a restorer")
-                    .finish();
-                if text.is_empty() {
-                    return Ok(None);
-                }
-                match kind {
-                    TextKind::Text => BlockDelta::Text(text),
-                    TextKind::Refusal => BlockDelta::Refusal(text),
-                }
-            }
-            StreamFieldKind::Arguments => {
-                let (text, _) = restore_json_text(session, &self.arguments)?;
-                if text.is_empty() {
-                    return Ok(None);
-                }
-                BlockDelta::ToolArguments(text)
+        let delta = match self {
+            Self::Text(kind, restorer) => kind.delta(restorer.finish()),
+            Self::Arguments(arguments) => {
+                BlockDelta::ToolArguments(restore_json_text(session, &arguments)?.0)
             }
         };
-        Ok(Some(StreamEvent::BlockDelta { index, delta }))
+        let empty = matches!(
+            &delta,
+            BlockDelta::Text(text)
+                | BlockDelta::Refusal(text)
+                | BlockDelta::Reasoning(text)
+                | BlockDelta::ReasoningSummary(text)
+                | BlockDelta::ToolArguments(text) if text.is_empty()
+        );
+        Ok((!empty).then_some(StreamEvent::BlockDelta { index, delta }))
     }
 }
 
@@ -830,15 +662,91 @@ enum StreamFieldKind {
     Arguments,
 }
 
-/// Ends the open field at `index`, returning its held-back tail if any.
-fn take_tail(
+impl StreamFieldKind {
+    const fn of_delta(delta: &BlockDelta) -> Option<Self> {
+        match delta {
+            BlockDelta::Text(_) => Some(Self::Text(TextKind::Text)),
+            BlockDelta::Refusal(_) => Some(Self::Text(TextKind::Refusal)),
+            BlockDelta::Reasoning(_) => Some(Self::Text(TextKind::Reasoning)),
+            BlockDelta::ReasoningSummary(_) => Some(Self::Text(TextKind::ReasoningSummary)),
+            BlockDelta::ToolArguments(_) => Some(Self::Arguments),
+            _ => None,
+        }
+    }
+}
+
+/// Returns any buffered text that must precede this event.
+fn flush_closing_field(
+    event: &StreamEvent,
     fields: &mut BTreeMap<u32, StreamField>,
-    index: u32,
     session: &RedactionSession,
 ) -> Result<Option<StreamEvent>, BoxError> {
+    let index = match event {
+        StreamEvent::BlockStart { index, .. } | StreamEvent::BlockStop { index } => index,
+        StreamEvent::BlockDelta { index, delta }
+            if fields.get(index).is_some_and(|field| {
+                StreamFieldKind::of_delta(delta).is_some_and(|kind| kind != field.kind())
+            }) =>
+        {
+            index
+        }
+        _ => return Ok(None),
+    };
     fields
-        .remove(&index)
-        .map_or(Ok(None), |field| field.finish(index, session))
+        .remove(index)
+        .map_or(Ok(None), |field| field.finish(*index, session))
+}
+
+fn restore_event(
+    event: &mut StreamEvent,
+    fields: &mut BTreeMap<u32, StreamField>,
+    session: &RedactionSession,
+) -> Result<bool, BoxError> {
+    match event {
+        StreamEvent::BlockStart { index, block } => {
+            if let Some((kind, text)) = block_text(block, session) {
+                let mut restorer = session.restorer();
+                *text = restorer.push(text);
+                fields.insert(*index, StreamField::Text(kind, restorer));
+            } else if let ContentBlock::ToolCall { arguments, .. } = block {
+                let initial = arguments.as_str();
+                if !initial.is_empty() && initial != "{}" {
+                    fields.insert(*index, StreamField::Arguments(initial.to_owned()));
+                    *arguments = ToolArguments::new("");
+                }
+            } else {
+                restore_block(session, block)?;
+            }
+            Ok(true)
+        }
+        StreamEvent::BlockDelta { index, delta } => {
+            let Some(kind) = StreamFieldKind::of_delta(delta) else {
+                return Ok(true);
+            };
+            let field = fields.entry(*index).or_insert_with(|| match kind {
+                StreamFieldKind::Text(kind) => StreamField::Text(kind, session.restorer()),
+                StreamFieldKind::Arguments => StreamField::Arguments(String::new()),
+            });
+            match (field, delta) {
+                (
+                    StreamField::Text(_, restorer),
+                    BlockDelta::Text(text)
+                    | BlockDelta::Refusal(text)
+                    | BlockDelta::Reasoning(text)
+                    | BlockDelta::ReasoningSummary(text),
+                ) => {
+                    *text = restorer.push(text);
+                    Ok(!text.is_empty())
+                }
+                (StreamField::Arguments(arguments), BlockDelta::ToolArguments(text)) => {
+                    arguments.push_str(text);
+                    Ok(false)
+                }
+                _ => unreachable!("the previous field was flushed before its kind changed"),
+            }
+        }
+        _ => Ok(true),
+    }
 }
 
 fn protocol_error(error: &BoxError) -> Error {
@@ -847,108 +755,32 @@ fn protocol_error(error: &BoxError) -> Error {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn restore_stream(session: RedactionSession, mut events: EventStream) -> EventStream {
     EventStream::from_stream(async_stream::try_stream! {
-        let mut fields: BTreeMap<u32, StreamField> = BTreeMap::new();
+        let mut fields = BTreeMap::<u32, StreamField>::new();
         while let Some(item) = events.next().await {
             let mut event = item?;
-            match &mut event {
-                StreamEvent::BlockStart { index, block } => {
-                    if let Some(tail) = take_tail(&mut fields, *index, &session)
-                        .map_err(|error| protocol_error(&error))?
-                    {
-                        yield tail;
-                    }
-                    if let Some((kind, text)) = block_text(block) {
-                        let mut field = StreamField::text(kind, &session);
-                        *text = field.push_text(text);
-                        fields.insert(*index, field);
-                    } else if let ContentBlock::ToolCall { arguments, .. } = block {
-                        let initial = arguments.as_str().to_owned();
-                        if !initial.is_empty() && initial != "{}" {
-                            *arguments = ToolArguments::new("");
-                            fields.insert(*index, StreamField::arguments(initial));
-                        }
-                    } else {
-                        restore_block(&session, block)
-                            .map_err(|error| protocol_error(&error))?;
-                    }
-                }
-                StreamEvent::BlockDelta { index, delta } => {
-                    let kind = match delta {
-                        BlockDelta::Text(_) => StreamFieldKind::Text(TextKind::Text),
-                        BlockDelta::Refusal(_) => StreamFieldKind::Text(TextKind::Refusal),
-                        BlockDelta::ToolArguments(_) => StreamFieldKind::Arguments,
-                        _ => {
-                            yield event;
-                            continue;
-                        }
-                    };
-                    let tail = if fields.get(index).is_some_and(|field| field.kind() != kind) {
-                        take_tail(&mut fields, *index, &session)
-                            .map_err(|error| protocol_error(&error))?
-                    } else {
-                        None
-                    };
-                    if let Some(tail) = tail {
-                        yield tail;
-                    }
-                    match delta {
-                        BlockDelta::Text(text) | BlockDelta::Refusal(text) => {
-                            let text_kind = match kind {
-                                StreamFieldKind::Text(text_kind) => text_kind,
-                                StreamFieldKind::Arguments => unreachable!(),
-                            };
-                            let field = fields
-                                .entry(*index)
-                                .or_insert_with(|| StreamField::text(text_kind, &session));
-                            *text = field.push_text(text);
-                            if text.is_empty() {
-                                continue;
-                            }
-                        }
-                        BlockDelta::ToolArguments(text) => {
-                            let field = fields
-                                .entry(*index)
-                                .or_insert_with(|| StreamField::arguments(String::new()));
-                            field.push_arguments(text);
-                            text.clear();
-                            continue;
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                StreamEvent::BlockStop { index } => {
-                    if let Some(tail) = take_tail(&mut fields, *index, &session)
-                        .map_err(|error| protocol_error(&error))?
-                    {
-                        yield tail;
-                    }
-                }
-                StreamEvent::MessageStart { .. } | StreamEvent::MessageStop { .. } => {
-                    for (index, field) in std::mem::take(&mut fields) {
-                        if let Some(tail) = field
-                            .finish(index, &session)
-                            .map_err(|error| protocol_error(&error))?
-                        {
-                            yield tail;
-                        }
-                    }
-                }
-                StreamEvent::Error { .. } => {
-                    yield event;
-                    return;
-                }
-                _ => {}
+            if matches!(event, StreamEvent::Error { .. }) {
+                yield event;
+                return;
             }
-            yield event;
-        }
-        for (index, field) in fields {
-            if let Some(tail) = field
-                .finish(index, &session)
+            if matches!(event, StreamEvent::MessageStart { .. } | StreamEvent::MessageStop { .. }) {
+                for (index, field) in std::mem::take(&mut fields) {
+                    if let Some(tail) = field.finish(index, &session).map_err(|error| protocol_error(&error))? {
+                        yield tail;
+                    }
+                }
+            } else if let Some(tail) = flush_closing_field(&event, &mut fields, &session)
                 .map_err(|error| protocol_error(&error))?
             {
+                yield tail;
+            }
+            if restore_event(&mut event, &mut fields, &session).map_err(|error| protocol_error(&error))? {
+                yield event;
+            }
+        }
+        for (index, field) in fields {
+            if let Some(tail) = field.finish(index, &session).map_err(|error| protocol_error(&error))? {
                 yield tail;
             }
         }
@@ -960,36 +792,42 @@ mod tests {
     use futures_util::FutureExt;
 
     use super::*;
-    use mpx_redact::{Mask, Matcher, Rule};
+    use mpx_redact::Matcher;
+
+    fn replacement() -> Replacement {
+        Replacement::kind("SECRET").unwrap()
+    }
 
     #[tokio::test]
     async fn restores_interleaved_fields_and_flushes_truncated_tokens_at_block_end() {
         let mut session = RedactionSession::new();
         let rules = Rules::new([
-            Rule::new(Matcher::Literal("first".into()), Mask::tag()),
-            Rule::new(Matcher::Literal("second".into()), Mask::tag()),
+            (Matcher::literal("first"), replacement()),
+            (Matcher::literal("second"), replacement()),
         ]);
         let first = session.mask("first", &rules).unwrap();
         let second = session.mask("second", &rules).unwrap();
+        let first_split = first.len() / 2;
+        let second_split = second.len() / 2;
         let events = EventStream::from_events(vec![
             StreamEvent::BlockStart {
                 index: 1,
-                block: ContentBlock::text(format!("opening {}", &first[..10])),
+                block: ContentBlock::text(format!("opening {}", &first[..first_split])),
             },
             StreamEvent::BlockStart {
                 index: 2,
                 block: ContentBlock::Refusal {
-                    text: second[..20].to_owned(),
+                    text: second[..second_split].to_owned(),
                     extra: None,
                 },
             },
             StreamEvent::BlockDelta {
                 index: 1,
-                delta: BlockDelta::Text(first[10..].to_owned()),
+                delta: BlockDelta::Text(first[first_split..].to_owned()),
             },
             StreamEvent::BlockDelta {
                 index: 2,
-                delta: BlockDelta::Refusal(format!("{} <|mpx", &second[20..])),
+                delta: BlockDelta::Refusal(format!("{} {{{{SECRET_", &second[second_split..])),
             },
             StreamEvent::BlockStop { index: 2 },
             StreamEvent::BlockStop { index: 1 },
@@ -1019,7 +857,7 @@ mod tests {
                 },
                 StreamEvent::BlockDelta {
                     index: 2,
-                    delta: BlockDelta::Refusal("<|mpx".to_owned())
+                    delta: BlockDelta::Refusal("{{SECRET_".to_owned())
                 },
                 StreamEvent::BlockStop { index: 2 },
                 StreamEvent::BlockStop { index: 1 },
@@ -1027,14 +865,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn restores_streamed_reasoning_and_summaries() {
+        let mut session = RedactionSession::new();
+        let rules = Rules::new([(Matcher::literal("private"), replacement())]);
+        let marker = session.mask("private", &rules).unwrap();
+        let split = marker.len() / 2;
+        let events = EventStream::from_events(vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block: ContentBlock::Reasoning {
+                    text: String::new(),
+                    summary: Vec::new(),
+                    seal: None,
+                    redacted: false,
+                    extra: None,
+                },
+            },
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: BlockDelta::Reasoning(format!("think {}", &marker[..split])),
+            },
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: BlockDelta::Reasoning(marker[split..].to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: BlockDelta::ReasoningSummary(format!("sum {marker}")),
+            },
+            StreamEvent::BlockStop { index: 0 },
+        ]);
+        let actual = restore_stream(session, events).into_events().await.unwrap();
+        let mut reasoning = String::new();
+        let mut summary = String::new();
+        for event in &actual {
+            match event {
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::Reasoning(text),
+                    ..
+                } => reasoning.push_str(text),
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::ReasoningSummary(text),
+                    ..
+                } => summary.push_str(text),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "think private");
+        assert_eq!(summary, "sum private");
+        assert_eq!(actual.last(), Some(&StreamEvent::BlockStop { index: 0 }));
+    }
+
     #[test]
     fn emits_safe_text_while_upstream_is_pending() {
         let events = EventStream::from_stream(async_stream::stream! {
-            yield Ok(StreamEvent::BlockStart { index: 1, block: ContentBlock::text("safe <|mpx") });
+            yield Ok(StreamEvent::BlockStart { index: 1, block: ContentBlock::text("safe {{SECRET_") });
             std::future::pending::<()>().await;
         });
         let mut session = RedactionSession::new();
-        let rules = Rules::new([Rule::new(Matcher::Literal("private".into()), Mask::tag())]);
+        let rules = Rules::new([(Matcher::literal("private"), replacement())]);
         let _ = session.mask("private", &rules).unwrap();
         let mut restored = restore_stream(session, events);
         assert_eq!(

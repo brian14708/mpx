@@ -2,59 +2,319 @@
 
 use std::fmt::Write as _;
 
-use mpx_redact::{
-    Digits, Error, Generator, GeneratorBinding, Hex, Mask, Matcher, Number, PlaceholderTemplate,
-    RedactionSession, Rule, Rules, WordList,
-};
+use mpx_redact::{Error, Matcher, RedactionSession, Replacement, Rules, Slot, SlotGenerator};
 
 fn tagged(matcher: Matcher) -> Rules {
-    Rules::new([Rule::new(matcher, Mask::tag())])
+    Rules::new([(matcher, Replacement::kind("SECRET").unwrap())])
 }
 
 #[test]
-fn counts_each_slot_occurrence_and_saturates_large_products() {
-    assert_eq!(PlaceholderTemplate::default().combinations(), 16_777_216);
-    let words: Vec<_> = (0..2048).map(|index| format!("word{index}")).collect();
-    let mut entries: Vec<_> = words.iter().map(String::as_str).collect();
-    entries.push(&words[0]);
-    let bindings = [GeneratorBinding::new(
-        "word",
-        WordList::new(&entries).unwrap(),
-    )];
-    let alias = Mask::alias("email", "{{word}}-{{word}}@example.com", &bindings).unwrap();
-    assert_eq!(alias.alias_combinations(), Some(4_194_304));
-    let marker = PlaceholderTemplate::new("<{{word}}-{{word}}-{{word}}>", &bindings).unwrap();
-    assert_eq!(marker.combinations(), 8_589_934_592);
-    assert_eq!(Mask::tag().alias_combinations(), None);
+fn marker_kinds_require_nonempty_uppercase_ascii_names() {
+    for kind in ["", "bad", "A-B", "A B", "É", "A{B}"] {
+        assert!(matches!(
+            Replacement::kind(kind),
+            Err(Error::InvalidTemplate)
+        ));
+    }
+    let rules = Rules::new([(
+        Matcher::literal("sample"),
+        Replacement::kind("API_KEY").unwrap(),
+    )]);
+    let mut session = RedactionSession::new();
+    let masked = session.mask("sample", &rules).unwrap();
+    assert!(masked.starts_with("{{API_KEY_"));
+    assert!(masked.ends_with("}}"));
+    assert_eq!(session.restore(&masked), "sample");
+}
 
-    let wide = PlaceholderTemplate::new(
-        "<{{hex}}-{{hex}}>",
-        &[GeneratorBinding::new("hex", Hex(16))],
+#[test]
+fn custom_generators_cannot_rewrite_template_text_or_earlier_slots() {
+    struct Reset;
+
+    impl SlotGenerator for Reset {
+        fn generate(&self, _: [u8; 32], _: usize, output: &mut String) {
+            assert_eq!(output, "");
+            output.clear();
+            output.push_str("second");
+        }
+    }
+
+    let mask =
+        Replacement::template("<{}:{}>", &[Slot::literal("first"), Slot::custom(Reset)]).unwrap();
+    let rules = Rules::new([(Matcher::literal("secret"), mask)]);
+    let mut session = RedactionSession::new();
+    let masked = session.mask("secret", &rules).unwrap();
+    assert_eq!(masked, "<first:second>");
+    assert_eq!(session.restore(&masked), "secret");
+}
+
+#[test]
+fn templates_seed_each_slot_separately() {
+    let digits =
+        Replacement::permanent_template("{}_{}", &[Slot::digits(6), Slot::digits(6)]).unwrap();
+    let rules = Rules::new([(Matcher::literal("secret"), digits)]);
+    let mut session = RedactionSession::new();
+    let masked = session.mask("secret", &rules).unwrap();
+    let (first, second) = masked.split_once('_').unwrap();
+    for slot in [first, second] {
+        assert_eq!(slot.len(), 6);
+        assert!(slot.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+    assert_ne!(first, second);
+    assert_eq!(session.mask("secret", &rules).unwrap(), masked);
+    assert_eq!(session.restore(&masked), masked);
+}
+
+#[test]
+fn custom_generators_receive_their_slot_index() {
+    struct Index;
+
+    impl SlotGenerator for Index {
+        fn generate(&self, seed: [u8; 32], slot_idx: usize, output: &mut String) {
+            write!(output, "{seed:?}:{slot_idx}").unwrap();
+        }
+    }
+
+    let slot = Slot::custom(Index);
+    let replacement =
+        Replacement::template("<{}|{}|{}>", &[slot.clone(), slot.clone(), slot]).unwrap();
+    let rules = Rules::new([(Matcher::literal("secret"), replacement)]);
+    let masked = RedactionSession::new().mask("secret", &rules).unwrap();
+    let parts: Vec<_> = masked
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .split('|')
+        .map(|part| part.rsplit_once(':').unwrap())
+        .collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!([parts[0].1, parts[1].1, parts[2].1], ["0", "1", "2"]);
+    assert_eq!(parts[0].0, parts[1].0);
+    assert_eq!(parts[1].0, parts[2].0);
+}
+
+#[test]
+fn replacement_map_records_permanent_masks_in_the_forward_direction() {
+    let permanent = Replacement::permanent_template("<{}>", &[Slot::literal("masked")]).unwrap();
+    let rules = Rules::new([
+        (Matcher::literal("first"), permanent.clone()),
+        (Matcher::literal("second"), permanent),
+        (Matcher::literal("third"), Replacement::mask("")),
+    ]);
+    let mut session = RedactionSession::new();
+    assert_eq!(
+        session.mask("first second third first", &rules).unwrap(),
+        "<masked> <masked>  <masked>"
+    );
+    let snapshot = session.replacement_map();
+    assert_eq!(snapshot.entries().len(), 0);
+    assert_eq!(snapshot.get("<masked>"), None);
+    assert_eq!(
+        snapshot.forward_entries().collect::<Vec<_>>(),
+        [("first", "<masked>"), ("second", "<masked>"), ("third", "")]
+    );
+
+    let reversible = session
+        .mask("first", &tagged(Matcher::literal("first")))
+        .unwrap();
+    let map = session.replacement_map();
+    assert_eq!(map.get(&reversible), Some("first"));
+    assert_eq!(
+        map.replacements_for("first").collect::<Vec<_>>(),
+        [reversible.as_str(), "<masked>"]
+    );
+    assert_eq!(
+        snapshot.replacements_for("first").collect::<Vec<_>>(),
+        ["<masked>"]
+    );
+}
+
+#[test]
+fn fixed_masks_can_be_reversible_or_permanent() {
+    let reversible = Replacement::template("<{}>", &[Slot::literal("fixed")]).unwrap();
+    let rules = Rules::new([
+        (Matcher::literal("first"), reversible.clone()),
+        (Matcher::literal("second"), reversible),
+        (Matcher::literal("last"), Replacement::mask("[removed]")),
+    ]);
+    let mut session = RedactionSession::new().with_fallback(Replacement::kind("SECRET").unwrap());
+    let masked = session.mask("first second last", &rules).unwrap();
+    assert!(masked.starts_with("<fixed> {{SECRET_"));
+    assert_eq!(session.restore(&masked), "first second [removed]");
+    let map = session.replacement_map();
+    assert_eq!(map.get("<fixed>"), Some("first"));
+    assert_eq!(map.get("[removed]"), None);
+    assert_eq!(
+        map.replacements_for("last").collect::<Vec<_>>(),
+        ["[removed]"]
+    );
+
+    let permanent = Rules::new([(Matcher::literal("last"), Replacement::mask("<fixed>"))]);
+    let fallback = session.mask("last", &permanent).unwrap();
+    assert!(fallback.starts_with("{{SECRET_"));
+    assert_eq!(session.restore(&fallback), fallback);
+}
+
+#[test]
+fn permanent_templates_and_reversible_replacements_cannot_share_an_alias() {
+    let reversible = Replacement::template("{}", &[Slot::literal("alias")]).unwrap();
+    let permanent = Replacement::permanent_template("<{}>", &[Slot::literal("alias")]).unwrap();
+    let rules = Rules::new([
+        (Matcher::literal("reversible"), reversible),
+        (Matcher::literal("permanent"), permanent),
+    ]);
+    for (input, prefix) in [
+        ("permanent reversible", "<alias>"),
+        ("reversible permanent", "alias"),
+    ] {
+        let mut session =
+            RedactionSession::new().with_fallback(Replacement::kind("SECRET").unwrap());
+        let masked = session.mask(input, &rules).unwrap();
+        let (first, fallback) = masked.split_once(' ').unwrap();
+        assert_eq!(first, prefix);
+        assert!(fallback.starts_with("{{SECRET_"));
+        let restored = session.restore(&masked);
+        if first == "<alias>" {
+            assert_eq!(restored, "<alias> reversible");
+        } else {
+            assert_eq!(restored, format!("reversible {fallback}"));
+        }
+    }
+
+    let mut session = RedactionSession::new();
+    assert!(matches!(
+        session.mask("permanent reversible", &rules),
+        Err(Error::ReplacementUnavailable { .. })
+    ));
+    assert_eq!(session.replacement_map().forward_entries().count(), 0);
+    assert_eq!(session.mask("permanent", &rules).unwrap(), "<alias>");
+    session.clear_reserved_replacements();
+    assert!(matches!(
+        session.mask("reversible", &rules),
+        Err(Error::ReplacementUnavailable { .. })
+    ));
+}
+
+#[test]
+fn mask_spans_falls_back_when_replacement_text_is_already_present() {
+    let replacement = Replacement::template("<{}>", &[Slot::number(0..=1)]).unwrap();
+    let private = "private";
+    let mut session = RedactionSession::new();
+    let first = session
+        .mask_spans(
+            private,
+            std::slice::from_ref(&(0..private.len())),
+            &replacement,
+        )
+        .unwrap();
+
+    let text = format!("{first} {private}");
+    let span = first.len() + 1..text.len();
+    let mut session = RedactionSession::new();
+    assert!(matches!(
+        session.mask_spans(&text, std::slice::from_ref(&span), &replacement),
+        Err(Error::ReplacementUnavailable { template }) if template == "<{}>"
+    ));
+    let mut session = session.with_fallback(Replacement::kind("SECRET").unwrap());
+    let masked = session
+        .mask_spans(&text, std::slice::from_ref(&span), &replacement)
+        .unwrap();
+    assert!(masked.starts_with(&format!("{first} {{{{SECRET_")));
+    assert_eq!(session.restore(&masked), text);
+}
+
+#[test]
+fn block_takes_precedence_over_an_overlapping_literal() {
+    let rules = Rules::new([
+        (
+            Matcher::literal("allowed"),
+            Replacement::kind("SECRET").unwrap(),
+        ),
+        (Matcher::literal("secret-ID"), Replacement::mask("removed")),
+        (Matcher::literal("ID"), Replacement::block()),
+    ]);
+    let mut session = RedactionSession::new();
+    assert!(matches!(
+        session.mask("allowed secret-ID", &rules),
+        Err(Error::Blocked)
+    ));
+    assert_eq!(session.replacement_map().entries().len(), 0);
+    assert_eq!(session.mask("unmatched", &rules).unwrap(), "unmatched");
+
+    let spans = [0..2, 1..2];
+    assert!(matches!(
+        session.mask_spans("ID", &spans, &Replacement::block()),
+        Err(Error::Blocked)
+    ));
+}
+
+#[test]
+fn builtin_rules_merge_overlapping_url_password_and_email() {
+    let original = "https://alice:demo-pass@example.org/db";
+    let rules = Rules::builtin();
+    let mut session = RedactionSession::new();
+    let masked = session.mask(original, &rules).unwrap();
+    let suffix = masked
+        .strip_prefix("https://alice:{{EMAIL_")
+        .and_then(|tag| tag.strip_suffix("}}/db"))
+        .unwrap();
+    assert_eq!(suffix.len(), 8);
+    assert!(
+        suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+    );
+    assert_eq!(session.replacement_map().entries().len(), 1);
+    assert_eq!(session.restore(&masked), original);
+}
+
+fn email_matcher() -> Matcher {
+    Matcher::regex(
+        r"[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
     )
-    .unwrap();
-    assert_eq!(wide.combinations(), u128::MAX);
+    .unwrap()
+}
+
+#[test]
+fn generates_repeated_slots_and_wide_outputs() {
+    let mut entries: Vec<_> = (0..2048).map(|index| format!("word{index}")).collect();
+    entries.insert(1, String::from("word0"));
+    let words = Slot::wordlist(entries).unwrap();
+    let mut value = String::new();
+    let mut seed = [0; 32];
+    seed[7] = 1;
+    words.generate(seed, 0, &mut value);
+    assert_eq!(value, "word1");
+    let alias =
+        Replacement::template("{}-{}@example.com", &[words.clone(), words.clone()]).unwrap();
+    let marker =
+        Replacement::template("<{}-{}-{}>", &[words.clone(), words.clone(), words]).unwrap();
+    let wide = Replacement::template("<{}-{}>", &[Slot::base16(16), Slot::base16(16)]).unwrap();
+    let rules = Rules::new([(Matcher::literal("secret"), alias)]);
+    let masked = RedactionSession::new().mask("secret", &rules).unwrap();
+    assert_ne!(masked, "");
+    let rules = Rules::new([(Matcher::literal("secret"), marker)]);
+    assert!(RedactionSession::new().mask("secret", &rules).is_ok());
+    let rules = Rules::new([(Matcher::literal("secret"), wide)]);
+    assert!(RedactionSession::new().mask("secret", &rules).is_ok());
 }
 
 struct Region;
 
-impl Generator for Region {
-    fn capacity(&self) -> u128 {
-        2
-    }
-
-    fn render(&self, index: u128, output: &mut String) {
-        output.push_str(if index == 0 { "north" } else { "sud" });
+impl SlotGenerator for Region {
+    fn generate(&self, seed: [u8; 32], _: usize, output: &mut String) {
+        output.push_str(if seed[0].is_multiple_of(2) {
+            "north"
+        } else {
+            "sud"
+        });
     }
 }
 
 #[test]
-fn aliases_and_placeholders_use_explicit_generator_bindings() {
-    let bindings = [
-        GeneratorBinding::new("serial", Digits(4)),
-        GeneratorBinding::new("region", Region),
-    ];
-    let mask = Mask::alias("account", "user-{{region}}-{{serial}}", &bindings).unwrap();
-    let rules = Rules::new([Rule::new(Matcher::Email, mask)]);
+fn aliases_and_replacements_use_explicit_generator_bindings() {
+    let bindings = [Slot::custom(Region), Slot::digits(4)];
+    let mask = Replacement::template("user-{}-{}", &bindings).unwrap();
+    let rules = Rules::new([(email_matcher(), mask)]);
     let original = "a@example.org";
     let mut session = RedactionSession::new();
     let alias = session.mask(original, &rules).unwrap();
@@ -67,38 +327,15 @@ fn aliases_and_placeholders_use_explicit_generator_bindings() {
     assert_eq!(serial.len(), 4);
     assert!(serial.bytes().all(|byte| byte.is_ascii_digit()));
     assert_eq!(session.restore(&alias), original);
-    let template = PlaceholderTemplate::new("<{{region}}>", &bindings).unwrap();
-    let mut session = RedactionSession::new().with_placeholder_template(template);
-    let masked = session
-        .mask("<north> a@example.org", &tagged(Matcher::Email))
-        .unwrap();
-    assert_eq!(masked, "<north> <sud>");
-    assert_eq!(session.restore(&masked), "<north> a@example.org");
     assert!(matches!(
-        PlaceholderTemplate::new("<{{serial:4}}>", &bindings),
-        Err(Error::InvalidAliasTemplate)
-    ));
-    assert!(matches!(
-        Mask::alias("account", "{{serial:4}}", &bindings),
-        Err(Error::InvalidAliasTemplate)
-    ));
-    assert!(matches!(
-        PlaceholderTemplate::new("<{{hex}}>", &[]),
-        Err(Error::UnboundAliasSlot { name }) if name == "hex"
-    ));
-    let duplicate_bindings = [
-        GeneratorBinding::new("region", Region),
-        GeneratorBinding::new("region", Digits(1)),
-    ];
-    assert!(matches!(
-        Mask::alias("account", "{{region}}", &duplicate_bindings),
-        Err(Error::InvalidAliasBinding)
+        Replacement::template("<{}>", &[]),
+        Err(Error::InvalidTemplate)
     ));
 }
 
 #[test]
 fn keyed_replacements_are_stable_within_a_scope() {
-    let rules = tagged(Matcher::Literal("secret".into()));
+    let rules = tagged(Matcher::literal("secret"));
     let first = RedactionSession::new()
         .with_hmac_key(b"gateway-secret")
         .with_scope("session-a")
@@ -126,44 +363,102 @@ fn keyed_replacements_are_stable_within_a_scope() {
 }
 
 #[test]
-fn custom_generators_reserve_values_and_probe_collisions() {
-    let (alias, template) = {
-        let name = String::from("region");
-        let bindings = [GeneratorBinding::new(&name, Region)];
-        let alias = Mask::alias("region", "region-{{region}}", &bindings).unwrap();
-        let template = PlaceholderTemplate::new("<{{region}}>", &bindings).unwrap();
-        (alias, template)
-    };
-    let rules = Rules::new([Rule::new(Matcher::Email, alias)]);
-    let mut exchange = RedactionSession::new().with_placeholder_template(template.clone());
-    let first = exchange.mask("a@example.org", &rules).unwrap();
-    assert!(["region-north", "region-sud"].contains(&first.as_str()));
-    let mut exchange = RedactionSession::new().with_placeholder_template(template);
-    let original = format!("{first}. <north> a@example.org");
+fn reserved_aliases_use_the_enabled_fallback_at_whole_value_boundaries() {
+    let alias = Replacement::template("region-{}", &[Slot::custom(Region)]).unwrap();
+    let rules = Rules::new([(email_matcher(), alias)]);
+    let private = "a@example.org";
+    let primary = RedactionSession::new().mask(private, &rules).unwrap();
+    let default = RedactionSession::new()
+        .mask(private, &tagged(Matcher::literal(private)))
+        .unwrap();
+
+    let mut exchange = RedactionSession::new().with_fallback(Replacement::kind("SECRET").unwrap());
+    let original = format!("prefix-{primary} {primary}. {private} {private}");
+    let masked = exchange.mask(&original, &rules).unwrap();
     assert_eq!(
-        exchange.mask(&original, &rules).unwrap(),
-        format!("{first}. <north> <sud>")
+        masked,
+        format!("prefix-{primary} {primary}. {default} {default}")
     );
+    assert_eq!(exchange.restore(&masked), original);
+    assert_eq!(exchange.replacement_map().entries().len(), 1);
+
+    let mut exchange = RedactionSession::new();
+    let original = format!("prefix-{primary} {primary}.suffix {private}");
+    let masked = exchange.mask(&original, &rules).unwrap();
     assert_eq!(
-        exchange.restore(&format!("{first}. <north> <sud>")),
-        original
+        masked,
+        format!("prefix-{primary} {primary}.suffix {primary}")
     );
+    assert_eq!(exchange.restore(&masked), original);
+}
+
+#[test]
+fn a_configured_alias_fallback_checks_reserved_text_and_issued_replacements() {
+    let primary = Replacement::template("<{}>", &[Slot::literal("taken")]).unwrap();
+    let fallback = Replacement::template("{}", &[Slot::literal("cedar")]).unwrap();
+    let rules = Rules::new([
+        (Matcher::literal("first"), primary.clone()),
+        (Matcher::literal("second"), primary),
+    ]);
+
+    let mut session = RedactionSession::new().with_fallback(fallback.clone());
+    session.reserve_replacements_in("<taken> cedar", &rules);
     assert!(matches!(
-        exchange.mask("b@example.org", &tagged(Matcher::Email)),
+        session.mask("first", &rules),
+        Err(Error::ReplacementUnavailable { template }) if template == "{}"
+    ));
+    assert_eq!(session.restore("cedar"), "cedar");
+
+    let mut session = RedactionSession::new().with_fallback(fallback);
+    session.reserve_replacements_in("<taken>", &rules);
+    assert_eq!(session.mask("first", &rules).unwrap(), "cedar");
+    assert!(matches!(
+        session.mask("second", &rules),
+        Err(Error::ReplacementUnavailable { template }) if template == "{}"
+    ));
+    assert_eq!(session.restore("cedar"), "first");
+}
+
+#[test]
+fn literal_replacements_are_reserved_for_collision_checks() {
+    let mask = Replacement::template("<{}>", &[Slot::number(0..=0)]).unwrap();
+    let rules = Rules::new([
+        (Matcher::literal("secret"), mask),
+        (Matcher::literal("public"), Replacement::mask("<0>")),
+    ]);
+    let mut exchange = RedactionSession::new();
+    assert!(matches!(
+        exchange.mask("public secret", &rules),
+        Err(Error::ReplacementUnavailable { template }) if template == "<{}>"
+    ));
+    let mut exchange = exchange.with_fallback(Replacement::kind("SECRET").unwrap());
+    let masked = exchange.mask("public secret", &rules).unwrap();
+    assert!(masked.starts_with("<0> {{SECRET_"));
+    assert_eq!(exchange.restore(&masked), "<0> secret");
+}
+
+#[test]
+fn empty_custom_slots_fail_even_in_framed_templates() {
+    struct Empty;
+    impl SlotGenerator for Empty {
+        fn generate(&self, _: [u8; 32], _: usize, _: &mut String) {}
+    }
+
+    let mask = Replacement::template("<{}>", &[Slot::custom(Empty)]).unwrap();
+    let rules = Rules::new([(Matcher::literal("secret"), mask)]);
+    let mut exchange = RedactionSession::new();
+    assert!(matches!(
+        exchange.mask("secret", &rules),
         Err(Error::ReplacementUnavailable { .. })
     ));
-    assert_eq!(exchange.replacement_map().entries().len(), 1);
+    assert_eq!(exchange.replacement_map().entries().len(), 0);
 }
 
 #[test]
 fn overlapping_marker_text_reserves_all_values() {
-    let template = PlaceholderTemplate::new(
-        ".{{digits}}.",
-        &[GeneratorBinding::new("digits", Digits(1))],
-    )
-    .unwrap();
-    let mut exchange = RedactionSession::new().with_placeholder_template(template);
-    let rules = tagged(Matcher::Literal("secret".into()));
+    let mask = Replacement::template(".{}.", &[Slot::digits(1)]).unwrap();
+    let mut exchange = RedactionSession::new();
+    let rules = Rules::new([(Matcher::literal("secret"), mask)]);
     let original = ".0.1.2.3.4.5.6.7.8.9.";
     exchange.reserve_replacements_in(original, &rules);
     assert!(matches!(
@@ -174,44 +469,35 @@ fn overlapping_marker_text_reserves_all_values() {
 }
 
 #[test]
-fn strict_mode_rejects_collisions_without_probing() {
-    let template = PlaceholderTemplate::new(
-        "<{{number}}>",
-        &[GeneratorBinding::new("number", Number(0..=0))],
-    )
-    .unwrap();
-    let rules = tagged(Matcher::Literal("secret".into()));
-    let mut session = RedactionSession::new()
-        .with_placeholder_template(template)
-        .with_strict();
+fn collisions_with_existing_map_entries_are_rejected_by_default() {
+    let mask = Replacement::template("<{}>", &[Slot::number(0..=0)]).unwrap();
+    let rules = Rules::new([(Matcher::literal("secret"), mask.clone())]);
+    let mut session = RedactionSession::new();
     let first = session.mask("secret", &rules).unwrap();
     assert_eq!(first, "<0>");
     let error = session
-        .mask("secret-2", &tagged(Matcher::Literal("secret-2".into())))
+        .mask(
+            "secret-2",
+            &Rules::new([(Matcher::literal("secret-2"), mask)]),
+        )
         .unwrap_err();
-    assert!(matches!(
-        error,
-        Error::ReplacementUnavailable {
-            combinations: 1,
-            attempts: 1,
-            ..
-        }
-    ));
-    assert!(error.to_string().contains("template \"<{{number}}>\""));
+    assert!(matches!(error, Error::ReplacementUnavailable { .. }));
+    assert!(error.to_string().contains("template \"<{}>\""));
 }
 
 #[test]
 fn template_changes_keep_previously_issued_markers_restorable() {
-    let rules = tagged(Matcher::regex(r"\bsecret-[0-9]+\b").unwrap());
+    let rules = Rules::new([(
+        Matcher::regex(r"\bsecret-[0-9]+\b").unwrap(),
+        Replacement::kind("SECRET").unwrap(),
+    )]);
     let mut exchange = RedactionSession::new();
     let first = exchange.mask("secret-1", &rules).unwrap();
-    let template = PlaceholderTemplate::new(
-        "[[hidden-{{hex}}]]",
-        &[GeneratorBinding::new("hex", Hex(8))],
-    )
-    .unwrap();
-    let mut exchange = exchange.with_placeholder_template(template);
-    let second = exchange.mask("secret-2", &rules).unwrap();
+    let second_rules = Rules::new([(
+        Matcher::regex(r"\bsecret-[0-9]+\b").unwrap(),
+        Replacement::template("[[hidden-{}]]", &[Slot::base16(8)]).unwrap(),
+    )]);
+    let second = exchange.mask("secret-2", &second_rules).unwrap();
     let combined = format!("α{first}{second}末");
 
     assert_eq!(exchange.restore(&combined), "αsecret-1secret-2末");
@@ -225,42 +511,146 @@ fn template_changes_keep_previously_issued_markers_restorable() {
 }
 
 #[test]
-fn labels_do_not_hide_ipv6_addresses() {
-    let rules = tagged(Matcher::IpAddress);
-    let text = "source:2001:db8::1 host:::1 address 2001:db8::g";
-    let matches: Vec<_> = rules
-        .find(text)
-        .into_iter()
-        .map(|span| &text[span])
-        .collect();
-    assert_eq!(matches, ["2001:db8::1", "::1"]);
+fn builtin_rules_mask_and_restore_representative_values() {
+    let rules = Rules::builtin();
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.e30.s8Kh1_zISiE2C5qsmPn1oaNh_S-i4aqu1Rg0TZjnFpg";
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            r#"（"josé smith"@example.org）"#,
+            "{{EMAIL_",
+            &[r#""josé smith"@example.org"#],
+        ),
+        (
+            "Read @param. Email café@例子.世界 or alice@server.42.example",
+            "{{EMAIL_",
+            &["café@例子.世界", "alice@server.42.example"],
+        ),
+        (
+            "alice@[IPv6:2001:db8::8]",
+            "{{EMAIL_",
+            &["alice@[IPv6:2001:db8::8]"],
+        ),
+        (
+            "192.0.2.8:8080 source:2001:db8::1 [::ffff:192.0.2.9%eth0]:443 999.0.2.8",
+            "{{IP_",
+            &["192.0.2.8", "2001:db8::1", "::ffff:192.0.2.9"],
+        ),
+        (
+            "https://alice:p%40ss@localhost/db",
+            "{{PASSWORD_",
+            &["p%40ss"],
+        ),
+        (r"C:\Users\alícé\notes.txt", "{{USERNAME_", &["alícé"]),
+        (r"C:\uſers\Åsa\notes.txt", "{{USERNAME_", &["Åsa"]),
+        ("Username: alice", "{{USERNAME_", &["alice"]),
+        (
+            "Host Name = build-01.internal",
+            "{{HOSTNAME_",
+            &["build-01.internal"],
+        ),
+        (
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "{{API_KEY_",
+            &["sk-proj-abcdefghijklmnopqrstuvwxyz"],
+        ),
+        (jwt, "{{TOKEN_", &[jwt]),
+    ];
+    for &(text, prefix, expected) in cases {
+        let matches: Vec<_> = rules
+            .try_find(text)
+            .unwrap()
+            .into_iter()
+            .map(|span| &text[span])
+            .collect();
+        assert_eq!(matches, expected, "{text:?}");
+
+        let mut session = RedactionSession::new();
+        let masked = session.mask(text, &rules).unwrap();
+        assert_eq!(masked.matches(prefix).count(), expected.len(), "{masked:?}");
+        assert_eq!(session.restore(&masked), text);
+    }
+
+    let text = "ssh -p 2222 alice@server";
+    let mut session = RedactionSession::new();
+    let masked = session.mask(text, &rules).unwrap();
+    let (user, host) = masked
+        .strip_prefix("ssh -p 2222 ")
+        .and_then(|target| target.split_once('@'))
+        .unwrap();
+    assert!(user.starts_with("{{USERNAME_"), "{masked:?}");
+    assert!(host.starts_with("{{HOSTNAME_"), "{masked:?}");
+    assert_eq!(session.restore(&masked), text);
 }
 
 #[test]
-fn a_malformed_private_key_block_does_not_hide_the_next_valid_block() {
-    let rules = tagged(Matcher::PrivateKey);
-    let key = "-----BEGIN RSA PRIVATE KEY-----\nsynthetic\n-----END RSA PRIVATE KEY-----";
-    let text = format!("-----BEGIN PRIVATE KEY-----\nincomplete\n{key}\nordinary text");
-    let matches: Vec<_> = rules
-        .find(&text)
-        .into_iter()
-        .map(|span| &text[span])
-        .collect();
-    assert_eq!(matches, [key]);
+fn builtin_rules_leave_boundary_cases_visible() {
+    let rules = Rules::builtin();
+    for text in [
+        "alice..bob@example.org",
+        "git clone git@github.com:owner/repo.git",
+        "MAC: 02:42:ac:11:00:02",
+        "https://localhost?next=:demo@localhost",
+        "https://docs.example.org:443@",
+        "/home/../shared",
+        "GET /users/settings HTTP/1.1",
+        "Hostname:\nstatus=ready\nUsername:\nStatus: ready",
+        "v1.0-release-notes-for-november",
+        "eyJxxxxxxxx.e30.abcdefgh eyJhbGciOiJIUzI1NiJ9.eA.abcdefgh",
+    ] {
+        assert_eq!(RedactionSession::new().mask(text, &rules).unwrap(), text);
+    }
+}
+
+#[test]
+fn streaming_restores_shared_prefixes_and_flushes_partial_markers() {
+    let cases = [
+        ("short-alias", "{}", "cèdre"),
+        ("long-alias", "{}", "cèdre.maple"),
+        ("short-marker", ".{}!", "maple"),
+        ("long-marker", ".{}!longer?", "maple"),
+        ("bracketed-marker", "[[{}]]", "test"),
+    ];
+    let rules = Rules::new(cases.into_iter().map(|(original, template, value)| {
+        (
+            Matcher::literal(original),
+            Replacement::template(template, &[Slot::literal(value)]).unwrap(),
+        )
+    }));
+    let mut session = RedactionSession::new();
+    for (original, template, value) in cases {
+        assert_eq!(
+            session.mask(original, &rules).unwrap(),
+            template.replace("{}", value)
+        );
+    }
+
+    let text = "α cèdre.maple. cèdre.maple!longer? .maple! 末 [[tes";
+    let expected = "α long-alias. short-aliaslong-marker short-marker 末 [[tes";
+    assert_eq!(session.restore(text), expected);
+    for split in text
+        .char_indices()
+        .map(|(split, _)| split)
+        .chain([text.len()])
+    {
+        let mut restorer = session.restorer();
+        let mut output = restorer.push(&text[..split]);
+        output.push_str(&restorer.push(""));
+        output.push_str(&restorer.push(&text[split..]));
+        output.push_str(&restorer.finish());
+        assert_eq!(output, expected, "split at byte {split}");
+    }
 }
 
 #[test]
 fn mixed_unicode_text_round_trips_under_many_chunk_partitions() {
     let rules = Rules::new([
-        Rule::new(Matcher::regex(r"\bsecret-[0-9]+\b").unwrap(), Mask::tag()),
-        Rule::new(
-            Matcher::Email,
-            Mask::alias(
-                "email",
-                "person-{{hex}}@example.invalid",
-                &[GeneratorBinding::new("hex", Hex(12))],
-            )
-            .unwrap(),
+        (
+            Matcher::regex(r"\bsecret-[0-9]+\b").unwrap(),
+            Replacement::kind("SECRET").unwrap(),
+        ),
+        (
+            email_matcher(),
+            Replacement::template("person-{}@example.invalid", &[Slot::base16(12)]).unwrap(),
         ),
     ]);
     let mut text = String::new();
