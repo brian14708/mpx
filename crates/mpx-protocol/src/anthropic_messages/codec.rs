@@ -59,7 +59,7 @@ impl ProtocolCodec for MessagesCodec {
     ) -> Result<Request> {
         let wire: MessagesRequest =
             serde_json::from_slice(body).map_err(|error| Error::json(Protocol::Messages, error))?;
-        let mut instructions = match wire.system {
+        let instructions = match wire.system {
             Some(value) => decode_content(value, cx)?,
             None => Vec::new(),
         };
@@ -100,9 +100,6 @@ impl ProtocolCodec for MessagesCodec {
         let mut extra = wire.extra;
         if !output_config.is_empty() {
             extra.insert("output_config".to_owned(), Value::Object(output_config));
-        }
-        if instructions.is_empty() {
-            instructions = Vec::new();
         }
         let metadata = wire.metadata.unwrap_or_default();
         let session_id = session_id_field(&metadata)

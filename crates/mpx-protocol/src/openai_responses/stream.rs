@@ -171,11 +171,11 @@ impl StreamDecoder for ResponsesStreamDecoder {
                                 events.push(StreamEvent::BlockStart {
                                     index,
                                     block: ContentBlock::ToolCall {
-                                        id: id.clone(),
-                                        name: name.clone(),
+                                        id,
+                                        name,
                                         arguments: ToolArguments::new(""),
-                                        seal: seal.clone(),
-                                        extra: extra.clone(),
+                                        seal,
+                                        extra,
                                     },
                                 });
                             }

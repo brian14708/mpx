@@ -1341,8 +1341,8 @@ fn decode_tool_choice(value: Value) -> ToolChoice {
         Some("auto") => ToolChoice::Auto,
         Some("none") => ToolChoice::None,
         Some("required") => ToolChoice::Required,
-        _ => named.map_or_else(
-            || ToolChoice::Native {
+        _ => named.map_or(
+            ToolChoice::Native {
                 protocol: Protocol::ChatCompletions,
                 json: value,
             },

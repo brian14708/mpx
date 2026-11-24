@@ -1,0 +1,106 @@
+[package]
+name = "mpx-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bitflags = "2"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
+http-body = "1"
+libfuzzer-sys = "0.4"
+mpx-core = { path = "../crates/mpx-core" }
+mpx-protocol = { path = "../crates/mpx-protocol" }
+mpx-redact = { path = "../crates/mpx-redact" }
+pollster = "1"
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+
+[workspace]
+members = ["."]
+
+[lints.cargo]
+unused_dependencies = "allow"
+
+[profile.release]
+debug = 1
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "protocol_request"
+path = "fuzz_targets/protocol_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_response"
+path = "fuzz_targets/protocol_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_stream"
+path = "fuzz_targets/protocol_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_roundtrip"
+path = "fuzz_targets/redact_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_builtin"
+path = "fuzz_targets/redact_builtin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_roundtrip"
+path = "fuzz_targets/protocol_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_mixed"
+path = "fuzz_targets/redact_mixed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_stateful"
+path = "fuzz_targets/redact_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_middleware"
+path = "fuzz_targets/redact_middleware.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_spans"
+path = "fuzz_targets/redact_spans.rs"
+test = false
+doc = false
+bench = false
