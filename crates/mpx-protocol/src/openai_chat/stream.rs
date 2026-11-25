@@ -12,7 +12,7 @@ use crate::{
 use super::{
     codec::{
         decode_reasoning_block, decode_usage, delta_for_native, encode_usage, make_extra,
-        same_extra, stream_error,
+        same_extra, split_response_extra, stream_error,
     },
     wire::{
         ChunkWire, DeltaToolCallWire, DeltaWire, ErrorBodyWire, ErrorEnvelopeWire, FinishReason,
@@ -404,17 +404,17 @@ impl ChatStreamEncoder {
             self.id = id;
         }
         self.model = model;
-        let mut extra = same_extra(extra, cx, "extra")?;
-        extra.remove("created");
-        extra.remove("object");
-        self.chunk(
+        let extra = split_response_extra(extra, cx)?;
+        self.chunk_with(
             DeltaWire {
                 role: Some(WireRole::Assistant),
+                extra: extra.message.unwrap_or_default(),
                 ..DeltaWire::default()
             },
             None,
             None,
-            extra,
+            extra.fields,
+            extra.choice,
         )
         .map(|frame| vec![frame])
     }
@@ -430,6 +430,17 @@ impl ChatStreamEncoder {
         usage: Option<UsageWire>,
         extra: Map<String, Value>,
     ) -> Result<SseEvent> {
+        self.chunk_with(delta, finish_reason, usage, extra, Map::new())
+    }
+
+    fn chunk_with(
+        &self,
+        delta: DeltaWire,
+        finish_reason: Option<FinishReason>,
+        usage: Option<UsageWire>,
+        extra: Map<String, Value>,
+        choice_extra: Map<String, Value>,
+    ) -> Result<SseEvent> {
         let has_finish = finish_reason.is_some();
         let chunk = ChunkWire {
             id: self.id.clone(),
@@ -441,7 +452,7 @@ impl ChatStreamEncoder {
                     index: 0,
                     delta,
                     finish_reason,
-                    extra: Map::new(),
+                    extra: choice_extra,
                 }]
             } else {
                 Vec::new()

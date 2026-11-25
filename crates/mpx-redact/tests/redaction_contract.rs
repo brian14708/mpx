@@ -1,6 +1,7 @@
 //! Public API redaction contracts.
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use mpx_redact::{Error, Matcher, RedactionSession, Replacement, Rules, Slot, SlotGenerator};
 
@@ -219,6 +220,64 @@ fn mask_spans_falls_back_when_replacement_text_is_already_present() {
         .mask_spans(&text, std::slice::from_ref(&span), &replacement)
         .unwrap();
     assert!(masked.starts_with(&format!("{first} {{{{SECRET_")));
+    assert_eq!(session.restore(&masked), text);
+}
+
+#[test]
+fn mask_spans_merges_overlaps_and_rejects_invalid_spans_without_side_effects() {
+    let text = "aé末z09";
+    let permanent = Replacement::mask("[m]");
+    for (spans, expected) in [
+        (vec![3..6, 1..6], "a[m]z09"),
+        (vec![1..3, 3..6], "a[m][m]z09"),
+    ] {
+        let mut session = RedactionSession::new();
+        let masked = session.mask_spans(text, &spans, &permanent).unwrap();
+        assert_eq!(masked, expected);
+        assert_eq!(session.restore(&masked), masked);
+        let before = session.replacement_map().entries().len();
+        // Empty, inside a multibyte character, past the end, and reversed.
+        #[expect(clippy::reversed_empty_ranges, reason = "invalid span under test")]
+        for invalid in [0..0, 2..3, text.len()..text.len() + 1, 4..3] {
+            assert!(matches!(
+                session.mask_spans(text, &[invalid], &permanent),
+                Err(Error::InvalidSpan { index: 0 })
+            ));
+            assert_eq!(session.replacement_map().entries().len(), before);
+        }
+    }
+}
+
+#[test]
+fn custom_detector_failures_and_invalid_spans_mask_nothing() {
+    let text = "aé末z";
+    let failing = [
+        Matcher::custom(|_| {
+            Err(Error::DetectorFailed {
+                message: "detector failure".to_owned(),
+            })
+        }),
+        Matcher::custom(|_| Ok(vec![Range { start: 2, end: 3 }])), // Inside the two-byte character.
+    ];
+    for detector in failing {
+        let rules = tagged(detector);
+        assert!(matches!(
+            rules.try_find(text),
+            Err(Error::DetectorFailed { .. })
+        ));
+        assert_eq!(rules.find(text).len(), 0);
+        let mut session = RedactionSession::new();
+        assert!(matches!(
+            session.mask(text, &rules),
+            Err(Error::DetectorFailed { .. })
+        ));
+        assert_eq!(session.replacement_map().entries().len(), 0);
+    }
+    let rules = tagged(Matcher::custom(|_| Ok(vec![Range { start: 1, end: 3 }])));
+    assert_eq!(rules.try_find(text).unwrap(), [Range { start: 1, end: 3 }]);
+    let mut session = RedactionSession::new();
+    let masked = session.mask(text, &rules).unwrap();
+    assert!(!masked.contains('é'));
     assert_eq!(session.restore(&masked), text);
 }
 
@@ -681,4 +740,50 @@ fn mixed_unicode_text_round_trips_under_many_chunk_partitions() {
         output.push_str(&restorer.finish());
         assert_eq!(output, text, "with {width}-character chunks");
     }
+}
+
+#[test]
+fn markers_cannot_combine_with_preceding_text_into_another_marker() {
+    // "|b" followed by the marker "|b|" reads as "|b|" then "b|".
+    let rules = Rules::new([(
+        Matcher::literal("secret"),
+        Replacement::template("|{}|", &[Slot::literal("b")]).unwrap(),
+    )]);
+    let text = "|bsecret";
+    assert!(matches!(
+        RedactionSession::new().mask(text, &rules),
+        Err(Error::ReplacementUnavailable { .. })
+    ));
+
+    let mut session = RedactionSession::new().with_fallback(Replacement::kind("SECRET").unwrap());
+    let masked = session.mask(text, &rules).unwrap();
+    assert!(masked.starts_with("|b{{SECRET_"), "{masked}");
+    assert_eq!(session.restore(&masked), text);
+    assert_eq!(session.replacement_map().entries().len(), 1);
+}
+
+#[test]
+fn masking_a_neighbor_cannot_expose_an_alias() {
+    let rules = Rules::new([(
+        Matcher::regex(r"\d").unwrap(),
+        Replacement::template("{}", &[Slot::literal("P")]).unwrap(),
+    )]);
+    let fallback = || Replacement::kind("SECRET").unwrap();
+
+    // "6" joins "P" and falls back, which leaves the original "P" standing alone.
+    let text = "P6 0";
+    let mut session = RedactionSession::new().with_fallback(fallback());
+    let masked = session.mask(text, &rules).unwrap();
+    assert_eq!(session.restore(&masked), text, "{masked}");
+    assert!(matches!(
+        RedactionSession::new().mask(text, &rules),
+        Err(Error::ReplacementUnavailable { .. })
+    ));
+
+    // The same exposure across fields: a later alias cannot appear in earlier masked text.
+    let mut session = RedactionSession::new().with_fallback(fallback());
+    let first = session.mask("P6", &rules).unwrap();
+    let second = session.mask("0", &rules).unwrap();
+    assert_eq!(session.restore(&first), "P6", "{first}");
+    assert_eq!(session.restore(&second), "0", "{second}");
 }

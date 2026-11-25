@@ -267,6 +267,44 @@ async fn transport_chunk_boundaries_do_not_change_protocol_events() {
     }
 }
 
+// Only one leading BOM is stripped; a second one prefixes the first field name.
+#[tokio::test]
+async fn leading_byte_order_marks_decode_the_same_at_every_chunk_boundary() {
+    const BOM: &[u8] = b"\xef\xbb\xbf";
+    let codec = Codec::default();
+    let fixture = STREAMS[3].as_bytes();
+    let plain = normalized_events(
+        &codec,
+        Protocol::GenerateContent,
+        vec![Ok(Bytes::from_static(fixture))],
+    )
+    .await;
+    for boms in 1..=2 {
+        let bytes = Bytes::from([BOM.repeat(boms), fixture.to_vec()].concat());
+        let expected =
+            normalized_events(&codec, Protocol::GenerateContent, vec![Ok(bytes.clone())]).await;
+        if boms == 1 {
+            assert_eq!(expected, plain);
+        } else {
+            assert_ne!(expected, plain, "a second BOM must not be stripped");
+        }
+        for first in 0..=BOM.len() * boms {
+            for second in first..=BOM.len() * boms + 1 {
+                let chunks = vec![
+                    Ok(bytes.slice(..first)),
+                    Ok(bytes.slice(first..second)),
+                    Ok(bytes.slice(second..)),
+                ];
+                let fragmented = normalized_events(&codec, Protocol::GenerateContent, chunks).await;
+                assert_eq!(
+                    fragmented, expected,
+                    "{boms} BOMs split at {first} and {second}"
+                );
+            }
+        }
+    }
+}
+
 // A syntactically valid prefix has neither a finish reason nor a terminal event.
 #[tokio::test]
 async fn early_eof_and_transport_failure_both_fail_in_each_upstream_protocol() {
@@ -375,4 +413,133 @@ async fn interactions_reasoning_and_function_argument_deltas_survive_buffering()
     assert_eq!(actual["steps"][1]["arguments"], json!({"city": "Boston"}));
     assert_eq!(actual["usage"]["total_input_tokens"], 11);
     assert_eq!(actual["usage"]["total_cached_tokens"], 5);
+}
+#[tokio::test]
+async fn sse_decoding_tolerates_a_bom_after_the_stream_start() {
+    let codec = Codec::default();
+    let event = json!({"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}]});
+    let data = format!("data: {event}\n\n");
+    let bom = "\u{feff}";
+    let comment = ": mpx-buffered-response-v1 generate_content e30\n";
+    let cases: [(Vec<Vec<u8>>, bool); 6] = [
+        (vec![format!("{bom}{data}").into()], true),
+        (
+            vec![
+                b"\xef".to_vec(),
+                [b"\xbb\xbf".as_slice(), data.as_bytes()].concat(),
+            ],
+            true,
+        ),
+        (vec![format!("{bom}{bom}{data}").into()], false),
+        // A lone leading BOM chunk must not let the next chunk strip a second one.
+        (vec![bom.into(), format!("{bom}{data}").into()], false),
+        (vec![format!("{comment}{bom}{data}").into()], false),
+        (
+            vec![
+                [comment.as_bytes(), b"\xef"].concat(),
+                [b"\xbb\xbf".as_slice(), data.as_bytes()].concat(),
+            ],
+            false,
+        ),
+    ];
+    for (chunks, decodes_text) in cases {
+        let chunks = chunks
+            .into_iter()
+            .map(|chunk| Ok(Bytes::from(chunk)))
+            .collect();
+        let events = normalized_events(&codec, Protocol::GenerateContent, chunks).await;
+        let has_text = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::BlockDelta {
+                    delta: mpx_protocol::BlockDelta::Text(text),
+                    ..
+                } if text == "hi"
+            )
+        });
+        assert_eq!(has_text, decodes_text, "{events:?}");
+    }
+}
+
+#[tokio::test]
+async fn gemini_candidate_extensions_cannot_shadow_modeled_response_fields() {
+    let codec = Codec::default();
+    let value = json!({"candidates":[{
+        "content":{"role":"model","parts":[{"text":"hi"}]},
+        "finishReason":"STOP",
+        "candidates":[],
+        "usageMetadata":{},
+        "vendorField":1
+    }]});
+    for stream in [false, true] {
+        let wire = http::Response::new(body(value.to_string()));
+        let mut decoded = codec
+            .decode_response(wire, Protocol::GenerateContent)
+            .await
+            .expect("complete Gemini response decodes");
+        Codec::disable_response_replay(&mut decoded);
+        let encoded = codec
+            .encode_response(decoded, &client(Protocol::GenerateContent, stream))
+            .await
+            .expect("response encodes");
+        let bytes = collect_body(encoded.into_body()).await;
+        let chunks = if stream {
+            sse_data(&bytes).await
+        } else {
+            vec![String::from_utf8(bytes.to_vec()).expect("UTF-8 JSON")]
+        };
+        for chunk in chunks {
+            // Decoding rejects duplicate modeled keys.
+            let wire = http::Response::new(body(chunk));
+            codec
+                .decode_response(wire, Protocol::GenerateContent)
+                .await
+                .expect("encoded chunk has no duplicate keys");
+        }
+    }
+}
+
+// Nested vendor fields are carried in response extras; synthesized streams
+// must put them back in place instead of emitting internal bookkeeping keys.
+#[tokio::test]
+async fn synthesized_streams_never_emit_internal_extra_keys() {
+    let codec = Codec::default();
+    let cases = [
+        (
+            Protocol::ChatCompletions,
+            json!({"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{
+                "index":0,"message":{"role":"assistant","content":"hi","vendor_msg":1},
+                "finish_reason":"stop","vendor_choice":2
+            }]}),
+        ),
+        (
+            Protocol::GenerateContent,
+            json!({"candidates":[{
+                "content":{"role":"model","parts":[{"text":"hi"}]},
+                "finishReason":"STOP","vendor_candidate":3
+            }],"promptFeedback":{"vendor_feedback":4}}),
+        ),
+    ];
+    for (protocol, value) in cases {
+        let wire = http::Response::new(body(value.to_string()));
+        let mut decoded = codec
+            .decode_response(wire, protocol)
+            .await
+            .expect("complete response decodes");
+        Codec::disable_response_replay(&mut decoded);
+        let encoded = codec
+            .encode_response(decoded, &client(protocol, true))
+            .await
+            .expect("response encodes as a stream");
+        let messages = sse_data(&collect_body(encoded.into_body()).await).await;
+        assert!(
+            messages.iter().all(|message| !message.contains("__mpx")),
+            "{protocol}: {messages:?}"
+        );
+        if protocol == Protocol::ChatCompletions {
+            let first: Value = serde_json::from_str(&messages[0]).expect("JSON chunk");
+            assert_eq!(first["choices"][0]["vendor_choice"], 2);
+            assert_eq!(first["choices"][0]["delta"]["vendor_msg"], 1);
+        }
+    }
 }

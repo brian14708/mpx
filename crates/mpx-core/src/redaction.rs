@@ -28,6 +28,8 @@ const DEFAULT_HMAC_KEY: &str = "mpx-redact-static-key-v1";
 /// use a versioned HMAC-SHA-256 derivation with the request session ID as scope. Raw passthrough
 /// routes are rejected. The client must be trusted to receive the restored values,
 /// since the upstream can echo any replacement it received.
+/// Streamed text beginning with a JSON object or array is buffered until the
+/// field closes so restored values retain valid JSON escaping and unchanged keys.
 ///
 /// Call [`RedactionLayer::with_replacement_map`] to attach the issued
 /// [`mpx_redact::ReplacementMap`] to each response's Rust extensions.
@@ -622,13 +624,35 @@ impl TextKind {
 
 enum StreamField {
     Text(TextKind, Restorer),
+    /// Text block content that is only whitespace so far.
+    PendingText(String),
+    /// Text block content that may be JSON, restored whole like a complete response.
+    JsonText(String),
     Arguments(String),
 }
 
 impl StreamField {
+    /// Starts a text field and returns the restored text that can be emitted now.
+    ///
+    /// Text blocks that open like a JSON container are buffered so replacements
+    /// inside their string literals are restored with JSON escaping.
+    fn text(kind: TextKind, session: &RedactionSession, text: String) -> (Self, String) {
+        if kind == TextKind::Text {
+            match text.trim_start().chars().next() {
+                None => return (Self::PendingText(text), String::new()),
+                Some('{' | '[') => return (Self::JsonText(text), String::new()),
+                Some(_) => {}
+            }
+        }
+        let mut restorer = session.restorer();
+        let emitted = restorer.push(&text);
+        (Self::Text(kind, restorer), emitted)
+    }
+
     const fn kind(&self) -> StreamFieldKind {
         match self {
             Self::Text(kind, _) => StreamFieldKind::Text(*kind),
+            Self::PendingText(_) | Self::JsonText(_) => StreamFieldKind::Text(TextKind::Text),
             Self::Arguments(_) => StreamFieldKind::Arguments,
         }
     }
@@ -640,6 +664,11 @@ impl StreamField {
     ) -> Result<Option<StreamEvent>, BoxError> {
         let delta = match self {
             Self::Text(kind, restorer) => kind.delta(restorer.finish()),
+            Self::PendingText(text) => BlockDelta::Text(text),
+            Self::JsonText(mut text) => {
+                restore_text_value(session, &mut text)?;
+                BlockDelta::Text(text)
+            }
             Self::Arguments(arguments) => {
                 BlockDelta::ToolArguments(restore_json_text(session, &arguments)?.0)
             }
@@ -705,9 +734,9 @@ fn restore_event(
     match event {
         StreamEvent::BlockStart { index, block } => {
             if let Some((kind, text)) = block_text(block, session) {
-                let mut restorer = session.restorer();
-                *text = restorer.push(text);
-                fields.insert(*index, StreamField::Text(kind, restorer));
+                let (field, restored) = StreamField::text(kind, session, std::mem::take(text));
+                *text = restored;
+                fields.insert(*index, field);
             } else if let ContentBlock::ToolCall { arguments, .. } = block {
                 let initial = arguments.as_str();
                 if !initial.is_empty() && initial != "{}" {
@@ -724,10 +753,25 @@ fn restore_event(
                 return Ok(true);
             };
             let field = fields.entry(*index).or_insert_with(|| match kind {
-                StreamFieldKind::Text(kind) => StreamField::Text(kind, session.restorer()),
+                StreamFieldKind::Text(kind) => StreamField::text(kind, session, String::new()).0,
                 StreamFieldKind::Arguments => StreamField::Arguments(String::new()),
             });
             match (field, delta) {
+                (field @ StreamField::PendingText(_), BlockDelta::Text(text)) => {
+                    let StreamField::PendingText(pending) = field else {
+                        unreachable!("matched a pending text field")
+                    };
+                    pending.push_str(text);
+                    let (next, restored) =
+                        StreamField::text(TextKind::Text, session, std::mem::take(pending));
+                    *field = next;
+                    *text = restored;
+                    Ok(!text.is_empty())
+                }
+                (StreamField::JsonText(buffer), BlockDelta::Text(text)) => {
+                    buffer.push_str(text);
+                    Ok(false)
+                }
                 (
                     StreamField::Text(_, restorer),
                     BlockDelta::Text(text)
@@ -861,6 +905,96 @@ mod tests {
                 },
                 StreamEvent::BlockStop { index: 2 },
                 StreamEvent::BlockStop { index: 1 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_json_text_restores_values_without_changing_keys_or_escaping() {
+        let secret = "a\"\\\n\0末";
+        let rules = Rules::new([(Matcher::literal(secret), replacement())]);
+        for close_block in [false, true] {
+            let mut session = RedactionSession::new();
+            let marker = session.mask(secret, &rules).unwrap();
+            let masked =
+                serde_json::json!({secret: "key stays", "value": marker, "nested": [marker, 42]})
+                    .to_string();
+            let expected =
+                serde_json::json!({secret: "key stays", "value": secret, "nested": [secret, 42]});
+            let mut events = vec![StreamEvent::BlockStart {
+                index: 0,
+                block: ContentBlock::text(" "),
+            }];
+            for ch in masked.chars() {
+                events.push(StreamEvent::BlockDelta {
+                    index: 0,
+                    delta: BlockDelta::Text(ch.to_string()),
+                });
+            }
+            if close_block {
+                events.push(StreamEvent::BlockStop { index: 0 });
+            }
+            events.push(StreamEvent::MessageStop {
+                stop_reason: mpx_protocol::StopReason::EndTurn,
+            });
+            let restored = restore_stream(session, EventStream::from_events(events))
+                .into_events()
+                .await
+                .unwrap();
+            let mut accumulator = mpx_protocol::ResponseAccumulator::new();
+            accumulator.extend(restored);
+            let response = accumulator.finish();
+            let ContentBlock::Text { text, .. } = &response.content[0] else {
+                panic!("expected text")
+            };
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_json_text_restores_values_with_json_escaping() {
+        let mut session = RedactionSession::new();
+        let rules = Rules::new([(Matcher::literal("a\"b\u{0}"), replacement())]);
+        let marker = session.mask("a\"b\u{0}", &rules).unwrap();
+        let original = serde_json::json!({"value": "a\"b\u{0}"}).to_string();
+        let masked = format!(r#"{{"value":"{marker}"}}"#);
+        let (head, tail) = masked.split_at(3);
+        let events = EventStream::from_events(vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block: ContentBlock::text(" "),
+            },
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: BlockDelta::Text(head.to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: BlockDelta::Text(tail.to_owned()),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::BlockStart {
+                index: 1,
+                block: ContentBlock::text(format!("plain {marker}")),
+            },
+        ]);
+        let actual = restore_stream(session, events).into_events().await.unwrap();
+        assert_eq!(
+            actual,
+            [
+                StreamEvent::BlockStart {
+                    index: 0,
+                    block: ContentBlock::text("")
+                },
+                StreamEvent::BlockDelta {
+                    index: 0,
+                    delta: BlockDelta::Text(original),
+                },
+                StreamEvent::BlockStop { index: 0 },
+                StreamEvent::BlockStart {
+                    index: 1,
+                    block: ContentBlock::text("plain a\"b\u{0}")
+                },
             ]
         );
     }

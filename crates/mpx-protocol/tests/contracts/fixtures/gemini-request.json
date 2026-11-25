@@ -1,7 +1,18 @@
 {
   "system_instruction": {"parts": [{"text": "Keep the reply short."}]},
   "contents": [
-    {"role": "user", "parts": [{"text": "Hello 🦉\nSay \"hi\".", "vendor_nested": {"flags": [true, false]}}]}
+    {"role": "user", "parts": [
+      {"text": "Hello 🦉\nSay \"hi\".", "vendor_nested": {"flags": [true, false]}},
+      {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo=", "vendor_blob": 1}, "vendor_part": "inline"},
+      {"fileData": {"mimeType": "application/pdf", "fileUri": "https://example.org/doc.pdf", "vendor_file": 2}, "vendor_part": "file"}
+    ]},
+    {"role": "model", "parts": [
+      {"functionCall": {"id": "call_1", "name": "weather", "args": {"place": "Boston"}, "vendor_call": 3}, "vendor_part": "call"}
+    ]},
+    {"role": "user", "parts": [
+      {"functionResponse": {"id": "call_1", "name": "weather", "response": {"forecast": "sunny"}, "vendor_result": 4}, "vendor_part": "result"}
+    ]}
   ],
+  "tools": [{"functionDeclarations": [{"name": "weather", "description": "Get the forecast.", "parameters": {"type": "object", "properties": {"place": {"type": "string"}}}}]}],
   "vendor_extension": null
 }

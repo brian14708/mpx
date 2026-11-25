@@ -9,7 +9,7 @@ use crate::{
 use super::{
     codec::{
         decode_blocks, decode_error_from_value, decode_usage, encode_error_value, encode_part,
-        encode_usage, normalized_stop_reason, response_chunk, take_extra,
+        encode_usage, normalized_stop_reason, response_chunk, response_extra,
     },
     wire::{GenerateContentResponse, Part},
 };
@@ -613,7 +613,7 @@ impl GeminiStreamEncoder {
     fn take_response_extra(&mut self, cx: &CodecContext) -> Result<serde_json::Map<String, Value>> {
         if self.extra_pending {
             self.extra_pending = false;
-            take_extra(self.extra.as_ref(), cx, "stream.extra")
+            response_extra(self.extra.as_ref(), cx, "stream.extra")
         } else {
             Ok(serde_json::Map::new())
         }

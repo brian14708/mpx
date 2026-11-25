@@ -135,8 +135,7 @@ fn route_segments_match(pattern: &[&str], path: &[&str]) -> bool {
     let Some((value, rest)) = path.split_first() else {
         return false;
     };
-    ((is_capture(head) && !value.is_empty()) || *head == *value)
-        && route_segments_match(tail, rest)
+    ((is_capture(head) && !value.is_empty()) || *head == *value) && route_segments_match(tail, rest)
 }
 
 fn split_segments(path: &str) -> impl Iterator<Item = &str> {

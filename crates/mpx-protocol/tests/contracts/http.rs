@@ -305,6 +305,70 @@ async fn response_echo_and_same_protocol_extra_fields_survive() {
 }
 
 #[tokio::test]
+async fn complete_responses_reject_lossy_streams_before_the_body_starts() {
+    let codec = Codec::builder()
+        .loss_policy(mpx_protocol::LossPolicy::Reject)
+        .build();
+    let upstream = http::Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body(
+            json!({"id":"int_1","object":"interaction","status":"unknown_status","steps":[]})
+                .to_string(),
+        ))
+        .unwrap();
+    let decoded = codec
+        .decode_response(upstream, Protocol::Interactions)
+        .await
+        .expect("response decodes");
+    let client = ClientContext::new(
+        Endpoint::builder(Protocol::Interactions)
+            .stream(true)
+            .build(),
+    );
+    // The streamed status is approximated, so encoding fails instead of the body.
+    let error = codec.encode_response(decoded, &client).await.unwrap_err();
+    assert!(
+        matches!(error, mpx_protocol::Error::LossPolicy { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_gemini_fields_named_like_response_fields_reencode_without_duplicates() {
+    let codec = Codec::default();
+    let upstream = http::Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body(
+            json!({
+                "candidates": [{"index": 0, "candidates": [], "usageMetadata": {}, "custom": 1}],
+                "promptFeedback": {"responseId": "x"},
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let mut decoded = codec
+        .decode_response(upstream, Protocol::GenerateContent)
+        .await
+        .expect("response decodes");
+    Codec::disable_response_replay(&mut decoded);
+    let encoded = codec
+        .encode_response(decoded, &ClientContext::new(Protocol::GenerateContent))
+        .await
+        .expect("response encodes");
+    let bytes = collect_body(encoded.into_body()).await;
+    let reencoded = http::Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body(bytes.clone()))
+        .unwrap();
+    codec
+        .decode_response(reencoded, Protocol::GenerateContent)
+        .await
+        .expect("re-encoded response has no duplicate fields");
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["custom"], 1);
+}
+
+#[tokio::test]
 async fn regenerated_sse_discards_original_body_and_connection_headers() {
     let codec = Codec::default();
     let client = ClientContext::new(Endpoint::builder(Protocol::Responses).stream(true).build());

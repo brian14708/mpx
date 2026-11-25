@@ -732,3 +732,36 @@ async fn interactions_continuation_uses_native_id_and_preserves_tool_results() {
     expected["stream"] = json!(true);
     assert_eq!(actual, expected);
 }
+
+#[tokio::test]
+async fn gemini_nested_modeled_fields_win_over_part_extensions() {
+    let codec = Codec::default();
+    let native = json!({"contents":[{"role":"model","parts":[
+        {"functionCall":{"id":"call-1","name":"lookup","args":{"a":1}},"id":"outer-id","name":"outer-name","args":"outer-args"},
+        {"inlineData":{"mimeType":"image/png","data":"AAAA"},"mimeType":"outer-type","data":"outer-data"},
+        {"fileData":{"mimeType":"image/png","fileUri":"https://example.org/image"},"mimeType":"outer-type","fileUri":"outer-uri"}
+    ]}]});
+    let mut decoded = codec
+        .decode_request(request("/v1beta/models/m:generateContent", &native))
+        .unwrap();
+    Codec::disable_request_replay(&mut decoded);
+    let encoded = codec
+        .encode_request(&decoded, Protocol::GenerateContent)
+        .unwrap();
+    let (mut parts, body) = encoded.into_parts();
+    parts.extensions.clear();
+    let bytes = collect_body(body).await;
+    let decoded = codec
+        .decode_request(http::Request::from_parts(parts, bytes))
+        .expect("encoder emits no duplicate modeled fields");
+    let blocks = &decoded.body().messages[0].content;
+    assert!(
+        matches!(&blocks[0], ContentBlock::ToolCall { name, arguments, .. } if name == "lookup" && arguments.value().unwrap() == json!({"a":1}))
+    );
+    assert!(
+        matches!(&blocks[1], ContentBlock::Image { source: mpx_protocol::MediaSource::Base64 { media_type, data }, .. } if media_type == "image/png" && data == "AAAA")
+    );
+    assert!(
+        matches!(&blocks[2], ContentBlock::Image { source: mpx_protocol::MediaSource::Url { url, .. }, .. } if url == "https://example.org/image")
+    );
+}

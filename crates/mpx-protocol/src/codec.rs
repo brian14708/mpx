@@ -19,8 +19,10 @@ use crate::{
     openai_responses::ResponsesCodec,
     protocol_codec::{CodecOptions, copy_header, is_forbidden_header},
     route::{Passthrough, detect_builtin},
-    sse::{BufferedResponse, decode_event_stream, encode_event_body, prepend_buffered_response},
-    stream::EventStream,
+    sse::{
+        BufferedResponse, decode_event_stream, encode_event_body, encode_events,
+        prepend_buffered_response,
+    },
     validate::{repair_history, validate_request},
 };
 
@@ -396,8 +398,12 @@ impl Codec {
                         },
                         Ok,
                     )?;
-                    let events = EventStream::from_events(response.to_stream_events());
-                    let body = encode_event_body(events, codec.stream_encoder(client), cx);
+                    let events = encode_events(
+                        response.to_stream_events(),
+                        codec.stream_encoder(client),
+                        &cx,
+                    )?;
+                    let body = bytes_body(events);
                     return Ok(stream_response(
                         parts,
                         prepend_buffered_response(body, client.endpoint.protocol, &complete_json),

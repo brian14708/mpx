@@ -147,7 +147,7 @@ fn spans_of(matches: Vec<RuleMatch<'_>>) -> Vec<Range<usize>> {
 pub fn mask(text: &str, spans: &[Range<usize>], replacement: &str) -> Result<String, Error> {
     let mask = Replacement::mask(replacement);
     let spans = merge_matches(masked_spans(text, spans, &mask)?)?;
-    replace_matches(text, spans, |output, _, _| {
+    replace_matches(text, &spans, |output, _, _| {
         output.push_str(replacement);
         Ok(())
     })
@@ -178,10 +178,10 @@ fn valid_span(text: &str, span: &Range<usize>) -> bool {
 
 pub(crate) fn replace_matches<'a>(
     text: &str,
-    merged: Vec<RuleMatch<'a>>,
-    mut rewrite: impl FnMut(&mut String, RuleMatch<'a>, Option<usize>) -> Result<(), Error>,
+    merged: &[RuleMatch<'a>],
+    mut rewrite: impl FnMut(&mut String, &RuleMatch<'a>, Option<usize>) -> Result<(), Error>,
 ) -> Result<String, Error> {
-    let mut spans = merged.into_iter().peekable();
+    let mut spans = merged.iter().peekable();
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     while let Some(matched) = spans.next() {

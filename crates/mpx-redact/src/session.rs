@@ -96,15 +96,23 @@ impl RedactionSession {
         }
     }
 
-    /// Releases the original fields reserved for collision checks after masking.
+    /// Releases the original fields and masked outputs reserved for collision
+    /// checks after masking.
     pub fn clear_reserved_replacements(&mut self) {
         self.reserved = HashSet::new();
     }
 
     /// Masks matches from the supplied rules.
     ///
+    /// The masked output is checked to restore to the original, with permanent
+    /// masks kept, and is reserved so later replacements cannot appear in it.
+    /// If a replacement would combine with adjacent text into another issued
+    /// replacement, the configured fallback is used for every match in the text.
+    ///
     /// # Errors
-    /// Returns an error if detection fails or a replacement cannot be applied.
+    /// Returns an error if detection fails or a replacement cannot be applied,
+    /// including [`Error::ReplacementUnavailable`] when the masked text would
+    /// not restore unambiguously.
     pub fn mask(&mut self, text: &str, rules: &Rules) -> Result<String, Error> {
         self.reserve_replacements_in(text, rules);
         self.mask_reserved(text, rules)
@@ -181,19 +189,48 @@ impl RedactionSession {
             return Err(Error::Blocked);
         }
         let spans = rules::merge_matches(spans)?;
-        let mut aliases = PreparedAliases::new(text, &spans, &self.reserved, |value| {
+        // Unmatched text is the caller's reserved original, which masking cannot make ambiguous.
+        if spans.is_empty() {
+            return Ok(text.to_owned());
+        }
+        // A replacement that combines with adjacent text into another issued
+        // replacement is retried with the fallback for every match in the text.
+        match self.replace_with(text, &spans, false) {
+            Err(Error::ReplacementUnavailable { .. }) if self.fallback.is_some() => {
+                self.replace_with(text, &spans, true)
+            }
+            result => result,
+        }
+    }
+
+    fn replace_with(
+        &mut self,
+        text: &str,
+        spans: &[RuleMatch<'_>],
+        force_fallback: bool,
+    ) -> Result<String, Error> {
+        let mut aliases = PreparedAliases::new(text, spans, &self.reserved, |value| {
             self.replacement_seed(value)
         })?;
         let mut pending = PendingReplacements::default();
         let mut reserved_markers = ReservedMarkerSearch::new(&self.reserved);
         let mut replacement = String::new();
         let mut slot = String::new();
+        // Output ranges of reversible replacements, with the values they restore to.
+        let mut restorable: Vec<(Range<usize>, &str)> = Vec::new();
+        let mut last_rule = None;
         let output = rules::replace_matches(text, spans, |output, matched, next| {
+            last_rule = Some(matched.replacement);
             let value = &text[matched.span.clone()];
             let after = &text[matched.span.end..];
-            let mut current = matched.replacement;
             let mut fallback = self.fallback.as_ref();
-            let mut is_primary = true;
+            let forced = if force_fallback {
+                fallback.take()
+            } else {
+                None
+            };
+            let mut is_primary = forced.is_none();
+            let mut current = forced.unwrap_or(matched.replacement);
             let mut seed = None;
             loop {
                 let rejected = if let Some(literal) = current.literal_replacement() {
@@ -252,6 +289,10 @@ impl RedactionSession {
                             self.permanent_available(candidate, &pending)
                         };
                         if available {
+                            if reversible {
+                                restorable
+                                    .push((output.len()..output.len() + candidate.len(), value));
+                            }
                             output.push_str(candidate);
                             pending.record(
                                 value,
@@ -269,8 +310,46 @@ impl RedactionSession {
                 is_primary = false;
             }
         })?;
+        self.commit_checked(output, pending, &restorable, last_rule)
+    }
+
+    /// Commits `pending` unless `output` would restore unmatched text, then
+    /// reserves `output` so later aliases cannot match text it exposed.
+    fn commit_checked(
+        &mut self,
+        output: String,
+        pending: PendingReplacements,
+        restorable: &[(Range<usize>, &str)],
+        last_rule: Option<&Replacement>,
+    ) -> Result<String, Error> {
+        let previous = self.replacements.clone();
         self.commit(pending);
+        if !self.restores(&output, restorable) {
+            self.replacements = previous;
+            return Err(unavailable(last_rule.map_or("", rule_pattern)));
+        }
+        self.reserve(&output, None);
         Ok(output)
+    }
+
+    /// Whether restoring `output` yields only the reversible values it was masked from.
+    ///
+    /// Masking can expose unmatched text that equals an issued replacement: a
+    /// framed marker can bound a neighboring alias, and a marker that starts with
+    /// the text before it can overlap an earlier match.
+    fn restores(&self, output: &str, restorable: &[(Range<usize>, &str)]) -> bool {
+        if self.replacements.entries().len() == 0 {
+            return true;
+        }
+        let mut expected = String::with_capacity(output.len());
+        let mut cursor = 0;
+        for (range, value) in restorable {
+            expected.push_str(&output[cursor..range.start]);
+            expected.push_str(value);
+            cursor = range.end;
+        }
+        expected.push_str(&output[cursor..]);
+        self.restorer().restore(output) == expected
     }
 
     fn commit(&mut self, pending: PendingReplacements) {
@@ -400,6 +479,12 @@ fn feed_seed(hash: &mut impl Update, scope: &[u8], value: &str) {
     }
 }
 
+fn rule_pattern(rule: &Replacement) -> &str {
+    rule.literal_replacement()
+        .or_else(|| rule.as_template().map(|(template, _)| template.pattern()))
+        .unwrap_or_default()
+}
+
 fn unavailable(template: &str) -> Error {
     Error::ReplacementUnavailable {
         template: template.to_owned(),
@@ -456,6 +541,57 @@ mod tests {
 
     fn replacement() -> Replacement {
         Replacement::kind("SECRET").unwrap()
+    }
+
+    #[test]
+    fn masking_that_exposes_an_issued_alias_fails_without_new_mappings() {
+        let alias = Replacement::template("{}", &[Slot::literal("P")]).unwrap();
+        let mut session = RedactionSession::new();
+        session
+            .mask("0", &Rules::new([(Matcher::literal("0"), alias)]))
+            .unwrap();
+        let before = session.replacement_map().forward_entries().count();
+        let hex = Replacement::template("|{}|", &[Slot::base16(8)]).unwrap();
+        // The marker for "6" would leave "P" bounded, so it would restore as "0".
+        assert!(matches!(
+            session.mask("P6", &Rules::new([(Matcher::literal("6"), hex)])),
+            Err(Error::ReplacementUnavailable { .. })
+        ));
+        assert_eq!(session.replacement_map().forward_entries().count(), before);
+    }
+
+    #[test]
+    fn markers_that_overlap_the_text_before_them_fail() {
+        let marker = Replacement::template("#{}#", &[Slot::literal("x")]).unwrap();
+        let mut session = RedactionSession::new();
+        // "#x" + "#x#" would restore the earlier "#x#" that starts in original text.
+        let text = "#xsecret";
+        let span = 2..text.len();
+        let result = session.mask_spans(text, std::slice::from_ref(&span), &marker);
+        assert!(
+            matches!(result, Err(Error::ReplacementUnavailable { .. })),
+            "{result:?}"
+        );
+        assert_eq!(session.replacement_map().entries().len(), 0);
+    }
+
+    #[test]
+    fn aliases_avoid_text_exposed_by_earlier_outputs() {
+        let rules = Rules::new([
+            (Matcher::literal("secret"), replacement()),
+            (
+                Matcher::literal("h"),
+                Replacement::template("{}", &[Slot::literal("0")]).unwrap(),
+            ),
+        ]);
+        let mut session = RedactionSession::new().with_fallback(replacement());
+        session.reserve_replacements_in("secret0", &rules);
+        session.reserve_replacements_in("h", &rules);
+        let first = session.mask_reserved("secret0", &rules).unwrap();
+        let second = session.mask_reserved("h", &rules).unwrap();
+        assert_ne!(second, "0", "the first output exposes a bounded \"0\"");
+        assert_eq!(session.restore(&first), "secret0");
+        assert_eq!(session.restore(&second), "h");
     }
 
     #[test]
@@ -525,6 +661,43 @@ mod tests {
             Err(Error::ReplacementUnavailable { template }) if template == "{}"
         ));
         assert_eq!(strict.replacement_map().entries().len(), 0);
+    }
+
+    #[test]
+    fn masking_cannot_expose_literal_text_as_an_issued_alias() {
+        let alias = Replacement::template("{}", &[Slot::literal("P")]).unwrap();
+        let zero = Rules::new([(Matcher::literal("0"), alias.clone())]);
+        let six = Rules::new([(Matcher::literal("6"), replacement())]);
+        let both = Rules::new([
+            (Matcher::literal("0"), alias),
+            (Matcher::literal("6"), replacement()),
+        ]);
+
+        // An earlier alias makes the literal "P" in "P6" ambiguous once "6" is masked.
+        let mut exchange = RedactionSession::new();
+        assert_eq!(exchange.mask("0", &zero).unwrap(), "P");
+        let before = exchange.replacement_map().entries().count();
+        for text in ["P6", "P.6", "6.P"] {
+            assert!(matches!(
+                exchange.mask(text, &six),
+                Err(Error::ReplacementUnavailable { .. })
+            ));
+        }
+        assert_eq!(exchange.replacement_map().entries().count(), before);
+
+        // A masked output also blocks a later alias.
+        let mut exchange = RedactionSession::new().with_fallback(replacement());
+        let masked = exchange.mask("P6", &six).unwrap();
+        let alias = exchange.mask("0", &zero).unwrap();
+        assert_ne!(alias, "P");
+        assert_eq!(exchange.restore(&masked), "P6");
+
+        // An alias issued by the same call falls back.
+        let masked = RedactionSession::new()
+            .with_fallback(replacement())
+            .mask("0 P6", &both)
+            .unwrap();
+        assert!(!masked.starts_with("P "), "{masked}");
     }
 
     #[test]

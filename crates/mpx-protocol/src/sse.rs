@@ -137,6 +137,24 @@ pub(crate) fn encode_event_body(
     BodyExt::boxed(StreamBody::new(SyncStream::new(frames)))
 }
 
+/// Encodes known events up front so encoding failures surface before a response starts.
+pub(crate) fn encode_events(
+    events: Vec<StreamEvent>,
+    mut encoder: Box<dyn StreamEncoder>,
+    cx: &CodecContext,
+) -> Result<Bytes> {
+    let mut output = String::new();
+    for event in events {
+        for frame in encoder.encode(event, cx)? {
+            encode_sse_into(&mut output, &frame);
+        }
+    }
+    for frame in encoder.finish(cx)? {
+        encode_sse_into(&mut output, &frame);
+    }
+    Ok(Bytes::from(output))
+}
+
 pub(crate) fn prepend_buffered_response(body: Body, protocol: Protocol, bytes: &[u8]) -> Body {
     // A comment carries buffered-only fields through the wire without changing native events.
     let comment = format!(
@@ -147,8 +165,10 @@ pub(crate) fn prepend_buffered_response(body: Body, protocol: Protocol, bytes: &
     BodyExt::boxed(StreamBody::new(leading.chain(BodyStream::new(body))))
 }
 
-// EventSource 0.2 slices its leading BOM at a byte offset of one and needs
-// a following byte to disambiguate a final CR from CRLF.
+// EventSource 0.2 slices its leading BOM at a byte offset of one, which panics
+// on the three-byte UTF-8 BOM, and needs a following byte to disambiguate a
+// final CR from CRLF. The spec's single BOM is stripped here; a leading blank
+// line, which dispatches nothing, keeps any further BOM away from that slice.
 fn decode_sse<B>(
     body: B,
     buffered: Option<BufferedResponse>,
@@ -162,18 +182,23 @@ where
         let mut body = std::pin::pin!(BodyDataStream::new(body));
         let mut prefix = Some(BytesMut::new());
         let mut trailing_cr = false;
+        let mut started = false;
+        let mut bom_checked = false;
         while let Some(data) = body.try_next().await.map_err(box_body_error)? {
             if data.is_empty() {
                 continue;
             }
             let data = if let Some(mut first) = prefix.take() {
                 first.extend_from_slice(&data);
-                if first.len() < BOM.len() && BOM.starts_with(&first) {
-                    prefix = Some(first);
-                    continue;
-                }
-                if first.starts_with(BOM) {
-                    first.advance(BOM.len());
+                if !bom_checked {
+                    if first.len() < BOM.len() && BOM.starts_with(&first) {
+                        prefix = Some(first);
+                        continue;
+                    }
+                    bom_checked = true;
+                    if first.starts_with(BOM) {
+                        first.advance(BOM.len());
+                    }
                 }
                 if let Some(buffered) = &buffered
                     && !take_buffered_comment(&mut first, buffered.protocol, &buffered.body)
@@ -186,11 +211,18 @@ where
                 data
             };
             if !data.is_empty() {
+                if !started {
+                    started = true;
+                    yield Bytes::from_static(b"\n");
+                }
                 trailing_cr = data.ends_with(b"\r");
                 yield data;
             }
         }
         if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) {
+            if !started {
+                yield Bytes::from_static(b"\n");
+            }
             yield prefix.freeze();
         } else if trailing_cr {
             yield Bytes::from_static(b"\n");
@@ -227,14 +259,19 @@ fn take_buffered_comment(
 
 fn encode_sse(frame: &SseEvent) -> Bytes {
     let mut output = String::with_capacity(frame.data.len() + 32);
+    encode_sse_into(&mut output, frame);
+    Bytes::from(output)
+}
+
+fn encode_sse_into(output: &mut String, frame: &SseEvent) {
     if !frame.event.is_empty() && frame.event != "message" && !frame.event.contains(['\r', '\n']) {
-        encode_field(&mut output, "event", &frame.event);
+        encode_field(output, "event", &frame.event);
     }
     if !frame.id.is_empty() && !frame.id.contains(['\0', '\r', '\n']) {
-        encode_field(&mut output, "id", &frame.id);
+        encode_field(output, "id", &frame.id);
     }
     if let Some(retry) = frame.retry {
-        encode_field(&mut output, "retry", &retry.as_millis().to_string());
+        encode_field(output, "retry", &retry.as_millis().to_string());
     }
     let data = if frame.data.contains('\r') {
         Cow::Owned(frame.data.replace("\r\n", "\n").replace('\r', "\n"))
@@ -242,10 +279,9 @@ fn encode_sse(frame: &SseEvent) -> Bytes {
         Cow::Borrowed(frame.data.as_str())
     };
     for line in data.split('\n') {
-        encode_field(&mut output, "data", line);
+        encode_field(output, "data", line);
     }
     output.push('\n');
-    Bytes::from(output)
 }
 
 fn encode_field(output: &mut String, field: &str, value: &str) {

@@ -320,7 +320,7 @@ pub(super) fn encode_response(
         usage_metadata: Some(encode_usage(&response.usage, cx)?),
         model_version: nonempty(&response.model),
         response_id: nonempty(&response.id),
-        extra: take_extra(response.extra.as_ref(), cx, "extra")?,
+        extra: response_extra(response.extra.as_ref(), cx, "extra")?,
     })
 }
 
@@ -672,11 +672,21 @@ pub(super) fn encode_part(
             encode_media(source, &mut part);
             match &mut part.inline_data {
                 Some(blob) => {
-                    blob.extra = take_extra(extra.as_ref(), cx, &format!("{path}.extra"))?;
+                    blob.extra = nested_extra(
+                        extra.as_ref(),
+                        cx,
+                        &format!("{path}.extra"),
+                        &["mimeType", "mime_type", "data"],
+                    )?;
                 }
                 None => {
                     if let Some(file) = &mut part.file_data {
-                        file.extra = take_extra(extra.as_ref(), cx, &format!("{path}.extra"))?;
+                        file.extra = nested_extra(
+                            extra.as_ref(),
+                            cx,
+                            &format!("{path}.extra"),
+                            &["mimeType", "mime_type", "fileUri", "file_uri"],
+                        )?;
                     }
                 }
             }
@@ -715,7 +725,12 @@ pub(super) fn encode_part(
                 id: nonempty(id.as_str()),
                 name: name.clone(),
                 args,
-                extra: take_extra(extra.as_ref(), cx, &format!("{path}.extra"))?,
+                extra: nested_extra(
+                    extra.as_ref(),
+                    cx,
+                    &format!("{path}.extra"),
+                    &["id", "name", "args"],
+                )?,
             });
         }
         ContentBlock::ToolResult {
@@ -740,7 +755,12 @@ pub(super) fn encode_part(
                 name: Some(name.clone()),
                 response,
                 parts,
-                extra: take_extra(extra.as_ref(), cx, &format!("{path}.extra"))?,
+                extra: nested_extra(
+                    extra.as_ref(),
+                    cx,
+                    &format!("{path}.extra"),
+                    &["id", "name", "response", "parts"],
+                )?,
             });
         }
         ContentBlock::Refusal { text, extra } => {
@@ -1352,6 +1372,40 @@ pub(super) fn take_extra(
     path: &str,
 ) -> Result<Map<String, Value>> {
     Extra::fields_for(extra, PROTOCOL, cx, path)
+}
+
+// Decoding combines part-level and nested extension fields. Modeled nested
+// fields win when that combined bag is emitted back into a nested wire object.
+fn nested_extra(
+    extra: Option<&Extra>,
+    cx: &CodecContext,
+    path: &str,
+    modeled: &[&str],
+) -> Result<Map<String, Value>> {
+    let mut fields = take_extra(extra, cx, path)?;
+    fields.retain(|key, _| !modeled.contains(&key.as_str()));
+    Ok(fields)
+}
+
+// Decoding folds candidate and prompt-feedback extensions into the response
+// bag, so they can name modeled top-level fields. Those fields win on encode.
+pub(super) fn response_extra(
+    extra: Option<&Extra>,
+    cx: &CodecContext,
+    path: &str,
+) -> Result<Map<String, Value>> {
+    nested_extra(
+        extra,
+        cx,
+        path,
+        &[
+            "candidates",
+            "promptFeedback",
+            "usageMetadata",
+            "modelVersion",
+            "responseId",
+        ],
+    )
 }
 
 fn merge_unknown(mut first: Map<String, Value>, second: Map<String, Value>) -> Map<String, Value> {

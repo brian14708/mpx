@@ -247,13 +247,10 @@ impl ProtocolCodec for ChatCompletionsCodec {
             extra.insert("created".to_owned(), Value::from(created));
         }
         if let Some(message_extra) = message.extra {
-            insert_internal_extra(&mut extra, "__mpx_chat_message_extra", message_extra);
+            insert_internal_extra(&mut extra, MESSAGE_EXTRA, message_extra);
         }
         if !choice.extra.is_empty() {
-            extra.insert(
-                "__mpx_chat_choice_extra".to_owned(),
-                Value::Object(choice.extra),
-            );
+            extra.insert(CHOICE_EXTRA.to_owned(), Value::Object(choice.extra));
         }
         Ok(Response {
             id: wire.id,
@@ -296,20 +293,18 @@ impl ProtocolCodec for ChatCompletionsCodec {
         cx: &CodecContext,
     ) -> Result<http::Response<Bytes>> {
         let mut message = encode_response_message(&response.content, cx)?;
-        let mut extra = same_extra(response.extra.as_ref(), cx, "extra")?;
-        if let Some(fields) = take_internal_extra(&mut extra, "__mpx_chat_message_extra") {
+        let ResponseExtra {
+            fields: extra,
+            message: message_extra,
+            choice: choice_extra,
+            created,
+            object,
+        } = split_response_extra(response.extra.as_ref(), cx)?;
+        if let Some(fields) = message_extra {
             message.extra = fields;
         }
-        let choice_extra =
-            take_internal_extra(&mut extra, "__mpx_chat_choice_extra").unwrap_or_default();
-        let created = extra
-            .remove("created")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let object = extra
-            .remove("object")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "chat.completion".to_owned());
+        let created = created.unwrap_or(0);
+        let object = object.unwrap_or_else(|| "chat.completion".to_owned());
         let wire = ResponseWire {
             id: if response.id.is_empty() {
                 "chatcmpl-0".to_owned()
@@ -406,10 +401,47 @@ fn insert_internal_extra(fields: &mut Map<String, Value>, key: &str, extra: Extr
     }
 }
 
+/// Internal response-extra keys for unmodeled message and choice fields.
+const MESSAGE_EXTRA: &str = "__mpx_chat_message_extra";
+const CHOICE_EXTRA: &str = "__mpx_chat_choice_extra";
+
+/// Response extra split back into the wire objects it was decoded from.
+pub(super) struct ResponseExtra {
+    /// Top-level response fields.
+    pub(super) fields: Map<String, Value>,
+    pub(super) message: Option<Map<String, Value>>,
+    pub(super) choice: Map<String, Value>,
+    pub(super) created: Option<u64>,
+    pub(super) object: Option<String>,
+}
+
+/// Splits response extra so internal message and choice keys never leak to the wire.
+pub(super) fn split_response_extra(
+    extra: Option<&Extra>,
+    cx: &CodecContext,
+) -> Result<ResponseExtra> {
+    let mut fields = same_extra(extra, cx, "extra")?;
+    let message = take_internal_extra(&mut fields, MESSAGE_EXTRA);
+    let choice = take_internal_extra(&mut fields, CHOICE_EXTRA).unwrap_or_default();
+    let created = fields.remove("created").and_then(|value| value.as_u64());
+    let object = match fields.remove("object") {
+        Some(Value::String(object)) => Some(object),
+        _ => None,
+    };
+    Ok(ResponseExtra {
+        fields,
+        message,
+        choice,
+        created,
+        object,
+    })
+}
+
 fn take_internal_extra(fields: &mut Map<String, Value>, key: &str) -> Option<Map<String, Value>> {
-    fields
-        .remove(key)
-        .and_then(|value| value.as_object().cloned())
+    match fields.remove(key)? {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
 }
 
 fn to_bytes(value: &impl Serialize) -> Result<Bytes> {
